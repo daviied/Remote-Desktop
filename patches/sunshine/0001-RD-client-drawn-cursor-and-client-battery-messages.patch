@@ -1,4 +1,4 @@
-From 61170908e855270ec9a15ef266daac567ded2e50 Mon Sep 17 00:00:00 2001
+From 421f5d27c026a6c599fcef42d1faa6f372b207c4 Mon Sep 17 00:00:00 2001
 From: rd <rd@local>
 Date: Mon, 23 Nov 2026 14:42:38 -0600
 Subject: [PATCH] RD: client-drawn cursor and client battery messages
@@ -9,8 +9,8 @@ Subject: [PATCH] RD: client-drawn cursor and client battery messages
  src/rd_cursor.cpp                      | 153 +++++++++++++++++++++++++
  src/rd_cursor.h                        |  65 +++++++++++
  src/rtsp.cpp                           |   3 +-
- src/stream.cpp                         |  82 ++++++++++++-
- 6 files changed, 310 insertions(+), 3 deletions(-)
+ src/stream.cpp                         |  81 ++++++++++++-
+ 6 files changed, 309 insertions(+), 3 deletions(-)
  create mode 100644 src/rd_cursor.cpp
  create mode 100644 src/rd_cursor.h
 
@@ -314,7 +314,7 @@ index c3e6b37..583ad5a 100644
      // Always request new control stream encryption if the client supports it
      uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
 diff --git a/src/stream.cpp b/src/stream.cpp
-index a222b40..53dd784 100644
+index a222b40..3742aa7 100644
 --- a/src/stream.cpp
 +++ b/src/stream.cpp
 @@ -29,6 +29,7 @@
@@ -336,7 +336,7 @@ index a222b40..53dd784 100644
      } control;  ///< Runtime state for the encrypted GameStream control channel.
  
      std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
-@@ -1184,6 +1189,55 @@ namespace stream {
+@@ -1184,6 +1189,54 @@ namespace stream {
      return 0;
    }
  
@@ -358,33 +358,32 @@ index a222b40..53dd784 100644
 +        BOOST_LOG(warning) << "RD: couldn't send cursor message"sv;
 +      }
 +    };
-+    auto put16 = [](std::vector<std::uint8_t> &v, std::uint16_t x) {
-+      v.push_back(x & 0xFF);
-+      v.push_back(x >> 8);
++    // Little-endian writes into pre-sized buffers (no push_back: GCC 14 -Werror false positive)
++    auto put16 = [](std::uint8_t *at, std::uint16_t x) {
++      at[0] = x & 0xFF;
++      at[1] = x >> 8;
 +    };
-+    auto put32 = [&](std::vector<std::uint8_t> &v, std::uint32_t x) {
-+      put16(v, x & 0xFFFF);
-+      put16(v, x >> 16);
++    auto put32 = [&](std::uint8_t *at, std::uint32_t x) {
++      put16(at, x & 0xFFFF);
++      put16(at + 2, x >> 16);
 +    };
 +
 +    std::uint32_t id = snap.shape ? snap.shape->id : 0;
 +    if (snap.shape && id != session->control.rd_cursor_sent_id) {
-+      std::vector<std::uint8_t> body;
-+      body.reserve(12 + snap.shape->bgra.size());
-+      put32(body, id);
-+      put16(body, snap.shape->width);
-+      put16(body, snap.shape->height);
-+      put16(body, snap.shape->hot_x);
-+      put16(body, snap.shape->hot_y);
-+      body.insert(body.end(), snap.shape->bgra.begin(), snap.shape->bgra.end());
++      std::vector<std::uint8_t> body(12 + snap.shape->bgra.size());
++      put32(body.data(), id);
++      put16(body.data() + 4, snap.shape->width);
++      put16(body.data() + 6, snap.shape->height);
++      put16(body.data() + 8, snap.shape->hot_x);
++      put16(body.data() + 10, snap.shape->hot_y);
++      std::copy(snap.shape->bgra.begin(), snap.shape->bgra.end(), body.begin() + 12);
 +      send_msg(rd_cursor::MSG_CURSOR_SHAPE, body);
 +      session->control.rd_cursor_sent_id = id;
 +    }
 +
-+    std::vector<std::uint8_t> state;
-+    put32(state, id);
-+    state.push_back(snap.visible ? 1 : 0);
-+    state.insert(state.end(), 3, 0);
++    std::vector<std::uint8_t> state(8, 0);
++    put32(state.data(), id);
++    state[4] = snap.visible ? 1 : 0;
 +    send_msg(rd_cursor::MSG_CURSOR_STATE, state);
 +    session->control.rd_cursor_seq = snap.seq;
 +  }
@@ -392,7 +391,7 @@ index a222b40..53dd784 100644
    /**
     * @brief Run the broadcast control-channel worker thread.
     *
-@@ -1194,6 +1248,11 @@ namespace stream {
+@@ -1194,6 +1247,11 @@ namespace stream {
        BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
      });
  
@@ -404,7 +403,7 @@ index a222b40..53dd784 100644
      server->map(packetTypes[IDX_START_A], [&](session_t *session, const std::string_view &payload) {
        BOOST_LOG(debug) << "type [IDX_START_A]"sv;
      });
-@@ -1340,6 +1399,7 @@ namespace stream {
+@@ -1340,6 +1398,7 @@ namespace stream {
      auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
      while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
        bool has_session_awaiting_peer = false;
@@ -412,7 +411,7 @@ index a222b40..53dd784 100644
  
        {
          auto lg = server->_sessions.lock();
-@@ -1395,6 +1455,13 @@ namespace stream {
+@@ -1395,6 +1454,13 @@ namespace stream {
  
                send_hdr_mode(session, std::move(hdr_info));
              }
@@ -426,7 +425,7 @@ index a222b40..53dd784 100644
            }
  
            ++pos;
-@@ -1407,7 +1474,8 @@ namespace stream {
+@@ -1407,7 +1473,8 @@ namespace stream {
          break;
        }
  
@@ -436,7 +435,7 @@ index a222b40..53dd784 100644
      }
  
      // Let all remaining connections know the server is shutting down
-@@ -2316,6 +2384,11 @@ namespace stream {
+@@ -2316,6 +2383,11 @@ namespace stream {
        BOOST_LOG(debug) << "Resetting Input..."sv;
        input::reset(session.input);
  
@@ -448,7 +447,7 @@ index a222b40..53dd784 100644
        // If this is the last session, invoke the platform callbacks
        if (--running_sessions == 0) {
          bool revert_display_config {config::video.dd.config_revert_on_disconnect};
-@@ -2368,6 +2441,13 @@ namespace stream {
+@@ -2368,6 +2440,13 @@ namespace stream {
  
        session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
  

@@ -1,0 +1,4 @@
+# Patches must stay byte-exact for git am; shell scripts must keep LF
+*.patch -text
+*.sh text eol=lf
+BASE_COMMIT text eol=lf

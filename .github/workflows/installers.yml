@@ -36,8 +36,8 @@ jobs:
         shell: pwsh
         run: |
           function Get-LatestRun($repo, $wf) {
-            $id = gh run list -R "$env:OWNER/$repo" -b rd -w $wf --status success -L 1 --json databaseId -q '.[0].databaseId'
-            if (-not $id) { throw "No successful $wf run on branch rd in $env:OWNER/$repo. Run forks/setup-forks.ps1 first." }
+            $id = gh run list -R "$env:OWNER/$repo" -b rd -w $wf --status completed -L 1 --json databaseId -q '.[0].databaseId'
+            if (-not $id) { throw "No finished $wf run on branch rd in $env:OWNER/$repo. Run forks/setup-forks.ps1 first." }
             $id
           }
           gh run download (Get-LatestRun moonlight-qt build.yml) -R "$env:OWNER/moonlight-qt" -p "Moonlight-Windows-x64-*" -D build/moonlight-dl
@@ -84,8 +84,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Download RD Moonlight .dmg
         run: |
-          id=$(gh run list -R "$OWNER/moonlight-qt" -b rd -w build.yml --status success -L 1 --json databaseId -q '.[0].databaseId')
-          [ -n "$id" ] || { echo "No successful build.yml run on branch rd in $OWNER/moonlight-qt"; exit 1; }
+          id=$(gh run list -R "$OWNER/moonlight-qt" -b rd -w build.yml --status completed -L 1 --json databaseId -q '.[0].databaseId')
+          [ -n "$id" ] || { echo "No finished build.yml run on branch rd in $OWNER/moonlight-qt"; exit 1; }
           gh run download "$id" -R "$OWNER/moonlight-qt" -p "Moonlight-macOS-*" -D build/dl
           dmg=$(find build/dl -name '*.dmg' | head -1)
           [ -n "$dmg" ] || { echo "No .dmg in the fork artifacts"; exit 1; }

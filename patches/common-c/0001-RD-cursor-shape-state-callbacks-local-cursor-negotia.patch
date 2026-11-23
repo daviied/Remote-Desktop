@@ -1,4 +1,4 @@
-From 04802a65a38adee6745493abcd2bc1a296a17004 Mon Sep 17 00:00:00 2001
+From 462fec275a06b6af8510c2d0008d7cfd5dcef28e Mon Sep 17 00:00:00 2001
 From: rd <rd@local>
 Date: Mon, 23 Nov 2026 14:44:07 -0600
 Subject: [PATCH] RD: cursor shape/state callbacks, local cursor negotiation,
@@ -144,10 +144,10 @@ index d41a55c..196abe3 100644
  #define UDP_RECV_POLL_TIMEOUT_MS 100
  
 diff --git a/src/Limelight.h b/src/Limelight.h
-index e471390..b9d6c1c 100644
+index 552d54a..a7a6ff6 100644
 --- a/src/Limelight.h
 +++ b/src/Limelight.h
-@@ -491,6 +491,14 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
+@@ -487,6 +487,14 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
  // This callback is invoked to set a controller's RGB LED (if present).
  typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
  
@@ -162,7 +162,7 @@ index e471390..b9d6c1c 100644
  typedef struct _CONNECTION_LISTENER_CALLBACKS {
      ConnListenerStageStarting stageStarting;
      ConnListenerStageComplete stageComplete;
-@@ -505,6 +513,8 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
+@@ -501,6 +509,8 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
      ConnListenerSetMotionEventState setMotionEventState;
      ConnListenerSetControllerLED setControllerLED;
      ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
@@ -171,7 +171,7 @@ index e471390..b9d6c1c 100644
  } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
  
  // Use this function to zero the connection callbacks when allocated on the stack or heap
-@@ -1025,8 +1035,23 @@ void LiRequestIdrFrame(void);
+@@ -1017,8 +1027,23 @@ void LiRequestIdrFrame(void);
  // This function returns any extended feature flags supported by the host.
  #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
  #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
@@ -196,10 +196,10 @@ index e471390..b9d6c1c 100644
  }
  #endif
 diff --git a/src/SdpGenerator.c b/src/SdpGenerator.c
-index 0ca207f..602409d 100644
+index 5ea5cbb..5d51375 100644
 --- a/src/SdpGenerator.c
 +++ b/src/SdpGenerator.c
-@@ -271,6 +271,9 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
+@@ -270,6 +270,9 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
      if (IS_SUNSHINE()) {
          // Send client feature flags to Sunshine hosts
          uint32_t moonlightFeatureFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;

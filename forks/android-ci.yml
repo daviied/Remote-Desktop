@@ -19,7 +19,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
-      - uses: android-actions/setup-android@v3
+      # The runner image already has the Android SDK + licenses (setup-android@v3 breaks on new images)
       - name: Build APK (debug-signed, installable)
         run: ./gradlew --no-daemon assembleNonRootDebug
       - uses: actions/upload-artifact@v4
