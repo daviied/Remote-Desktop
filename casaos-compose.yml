@@ -1,0 +1,31 @@
+# WireGuard mode (your own tunnel): smart-outlet power only.
+# Paste into CasaOS -> Custom Install -> Import. Edit the values marked EDIT.
+# For Tailscale mode use casaos-compose-tailscale.yml instead.
+name: rd-power
+services:
+  rd-power:
+    image: ghcr.io/daviied/rd-power:latest
+    container_name: rd-power
+    restart: unless-stopped
+    environment:
+      RD_POWER_TOKEN: change-me-to-a-long-random-string   # EDIT (openssl rand -hex 32)
+      HOST_ADDR: 192.168.1.20                             # EDIT: host fixed LAN IP
+      POWER_BACKEND: homeassistant                        # EDIT: homeassistant | tuya-local | tuya-cloud
+      HA_URL: http://homeassistant.local:8123             # EDIT
+      HA_TOKEN: ""                                        # EDIT
+      HA_ENTITY: switch.pc_outlet                         # EDIT
+      TUYA_DEVICE_ID: ""
+      TUYA_LOCAL_KEY: ""
+      TUYA_IP: ""
+      TUYA_VERSION: "3.3"
+    # Plain HTTP for your nginx only. Never port-forward it on the router.
+    # If nginx runs on this same machine, use "127.0.0.1:8090:8090".
+    ports:
+      - "8090:8090"
+
+x-casaos:
+  architectures: [amd64, arm64]
+  main: rd-power
+  title:
+    en_us: RD Power
+  port_map: "8090"

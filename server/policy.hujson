@@ -1,0 +1,17 @@
+// Access policy: only your devices can reach the host, and only on stream ports.
+// User "rd" owns all client devices. Hosts carry tag:host, set only by a tagged pre-auth key
+// (no device can tag itself). Everything not listed is denied, so clients cannot reach each other.
+{
+  "tagOwners": {
+    "tag:host": []
+  },
+  "acls": [
+    // Clients (laptop, tablet) -> host: Sunshine ports for both instances
+    // (display 1 base 47989, display 2 base 48089, display 3 base 48189).
+    { "action": "accept", "src": ["rd@"], "dst": ["tag:host:47984-48210"] },
+    // Clients -> host USB agent (rd-usbhost)
+    { "action": "accept", "src": ["rd@"], "dst": ["tag:host:47900"] },
+    // Host -> clients USB/IP export (usbipd), for USB passthrough
+    { "action": "accept", "src": ["tag:host"], "dst": ["rd@:3240"] }
+  ]
+}

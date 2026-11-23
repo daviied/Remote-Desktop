@@ -1,0 +1,316 @@
+From 80dc6000fbe9955b6f5185d2393db8b6ed936eae Mon Sep 17 00:00:00 2001
+From: rd <rd@local>
+Date: Mon, 23 Nov 2026 14:52:31 -0600
+Subject: [PATCH] RD: client-drawn cursor (absolute mouse mode) and battery
+ reporting
+
+---
+ app/src/main/java/com/limelight/Game.java     | 118 ++++++++++++++++++
+ .../nvstream/NvConnectionListener.java        |   4 +
+ .../limelight/nvstream/jni/MoonBridge.java    |  20 +++
+ app/src/main/jni/moonlight-core/callbacks.c   |  53 ++++++++
+ 4 files changed, 195 insertions(+)
+
+diff --git a/app/src/main/java/com/limelight/Game.java b/app/src/main/java/com/limelight/Game.java
+index 8d369b3..66a0f02 100644
+--- a/app/src/main/java/com/limelight/Game.java
++++ b/app/src/main/java/com/limelight/Game.java
+@@ -45,6 +45,11 @@ import android.app.Service;
+ import android.content.ComponentName;
+ import android.content.Context;
+ import android.content.Intent;
++import android.content.IntentFilter;
++import android.graphics.Bitmap;
++import android.os.BatteryManager;
++import android.view.PointerIcon;
++import java.util.HashMap;
+ import android.content.ServiceConnection;
+ import android.content.SharedPreferences;
+ import android.content.pm.ActivityInfo;
+@@ -134,6 +139,20 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+     private int modifierFlags = 0;
+     private boolean grabbedInput = true;
+     private boolean cursorVisible = false;
++
++    // RD extension: client-drawn cursor + battery reporting
++    private final HashMap<Integer, Object> rdCursorIcons = new HashMap<>();
++    private int rdCursorId = 0;
++    private boolean rdHostCursorVisible = true;
++    private boolean rdLocalCursor = false;
++    private final Handler rdBatteryHandler = new Handler();
++    private final Runnable rdBatteryTask = new Runnable() {
++        @Override
++        public void run() {
++            rdSendBattery();
++            rdBatteryHandler.postDelayed(this, 60000);
++        }
++    };
+     private boolean waitingForAllModifiersUp = false;
+     private int specialKeyCode = KeyEvent.KEYCODE_UNKNOWN;
+     private StreamView streamView;
+@@ -482,6 +501,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+                 .build();
+ 
+         // Initialize the connection
++        // RD: in remote-desktop mouse mode, ask the host to let us draw the cursor
++        MoonBridge.rdSetLocalCursorRequested(prefConfig.absoluteMouseMode);
++
+         conn = new NvConnection(getApplicationContext(),
+                 new ComputerDetails.AddressTuple(host, port),
+                 httpsPort, uniqueId, config,
+@@ -1157,6 +1179,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+             if (cursorVisible) {
+                 inputCaptureProvider.showCursor();
+             }
++            rdApplyCursor();
+         }
+         else {
+             inputCaptureProvider.disableCapture();
+@@ -2226,6 +2249,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+     }
+ 
+     private void stopConnection() {
++        rdBatteryHandler.removeCallbacks(rdBatteryTask);
+         if (connecting || connected) {
+             connecting = connected = false;
+             updatePipAutoEnter();
+@@ -2431,6 +2455,11 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+                 // Keep the display on
+                 getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+ 
++                // RD: client-drawn cursor and battery reporting
++                rdLocalCursor = MoonBridge.rdIsLocalCursorActive();
++                rdBatteryHandler.removeCallbacks(rdBatteryTask);
++                rdBatteryHandler.postDelayed(rdBatteryTask, 2000);
++
+                 // Update GameManager state to indicate we're in game
+                 UiHelper.notifyStreamConnected(Game.this);
+ 
+@@ -2502,6 +2531,95 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+         controllerHandler.handleSetControllerLED(controllerNumber, r, g, b);
+     }
+ 
++    // ---------------- RD extension ----------------
++
++    @Override
++    public void rdSetCursorShape(final int id, final short width, final short height, final short hotX, final short hotY, final byte[] bgra) {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
++            return;
++        }
++        int w = width & 0xFFFF, h = height & 0xFFFF;
++        int[] argb = new int[w * h];
++        for (int i = 0; i < argb.length; i++) {
++            int b = bgra[i * 4] & 0xFF, g = bgra[i * 4 + 1] & 0xFF, r = bgra[i * 4 + 2] & 0xFF, a = bgra[i * 4 + 3] & 0xFF;
++            argb[i] = (a << 24) | (r << 16) | (g << 8) | b;
++        }
++        final Bitmap bitmap = Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888);
++        runOnUiThread(new Runnable() {
++            @Override
++            public void run() {
++                // Scale host pixels to screen pixels like the video
++                float scale = streamView != null && streamView.getWidth() > 0 ? (float) streamView.getWidth() / prefConfig.width : 1.0f;
++                int sw = Math.max(1, Math.round(bitmap.getWidth() * scale));
++                int sh = Math.max(1, Math.round(bitmap.getHeight() * scale));
++                Bitmap scaled = (sw == bitmap.getWidth() && sh == bitmap.getHeight()) ? bitmap : Bitmap.createScaledBitmap(bitmap, sw, sh, true);
++                float hx = Math.min(sw - 1, (hotX & 0xFFFF) * scale);
++                float hy = Math.min(sh - 1, (hotY & 0xFFFF) * scale);
++                if (rdCursorIcons.size() > 64) {
++                    rdCursorIcons.clear();
++                }
++                rdCursorIcons.put(id, PointerIcon.create(scaled, hx, hy));
++                rdCursorId = id;
++                rdApplyCursor();
++            }
++        });
++    }
++
++    @Override
++    public void rdSetCursorState(final int id, final boolean visible) {
++        runOnUiThread(new Runnable() {
++            @Override
++            public void run() {
++                if (id != 0) {
++                    rdCursorId = id;
++                }
++                rdHostCursorVisible = visible;
++                rdApplyCursor();
++            }
++        });
++    }
++
++    private void rdApplyCursor() {
++        if (!rdLocalCursor || streamView == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
++            return;
++        }
++        Object icon = rdCursorIcons.get(rdCursorId);
++        if (rdHostCursorVisible && icon != null) {
++            streamView.setPointerIcon((PointerIcon) icon);
++        }
++        else {
++            streamView.setPointerIcon(PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL));
++        }
++    }
++
++    private void rdSendBattery() {
++        Intent status = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
++        int percent = 255;
++        int flags = 0;
++        if (status != null) {
++            int level = status.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
++            int scale = status.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
++            if (level >= 0 && scale > 0) {
++                percent = Math.round(level * 100f / scale);
++            }
++            if (!status.getBooleanExtra(BatteryManager.EXTRA_PRESENT, true)) {
++                flags = 4;
++            }
++            else {
++                int st = status.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
++                if (st == BatteryManager.BATTERY_STATUS_CHARGING) flags = 2;
++                else if (st == BatteryManager.BATTERY_STATUS_DISCHARGING || st == BatteryManager.BATTERY_STATUS_NOT_CHARGING) flags = 1;
++            }
++        }
++        int minutes = 0xFFFF;
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && (flags & 2) != 0) {
++            BatteryManager bm = (BatteryManager) getSystemService(BATTERY_SERVICE);
++            long ms = bm != null ? bm.computeChargeTimeRemaining() : -1;
++            if (ms > 0) minutes = (int) Math.min(0xFFFE, ms / 60000);
++        }
++        MoonBridge.rdSendBatteryStatus(percent, flags, minutes, Build.MODEL);
++    }
++
+     @Override
+     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+         if (!surfaceCreated) {
+diff --git a/app/src/main/java/com/limelight/nvstream/NvConnectionListener.java b/app/src/main/java/com/limelight/nvstream/NvConnectionListener.java
+index a6109db..da9450b 100644
+--- a/app/src/main/java/com/limelight/nvstream/NvConnectionListener.java
++++ b/app/src/main/java/com/limelight/nvstream/NvConnectionListener.java
+@@ -20,4 +20,8 @@ public interface NvConnectionListener {
+     void setMotionEventState(short controllerNumber, byte motionType, short reportRateHz);
+ 
+     void setControllerLED(short controllerNumber, byte r, byte g, byte b);
++
++    // RD extension (called on a native thread)
++    default void rdSetCursorShape(int id, short width, short height, short hotX, short hotY, byte[] bgra) {}
++    default void rdSetCursorState(int id, boolean visible) {}
+ }
+diff --git a/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java b/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java
+index 0dcafff..ebaea58 100644
+--- a/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java
++++ b/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java
+@@ -322,6 +322,26 @@ public class MoonBridge {
+         }
+     }
+ 
++    // RD extension: client-drawn cursor
++    public static void bridgeClRdSetCursorShape(int id, short width, short height, short hotX, short hotY, byte[] bgra) {
++        if (connectionListener != null) {
++            connectionListener.rdSetCursorShape(id, width, height, hotX, hotY, bgra);
++        }
++    }
++
++    public static void bridgeClRdSetCursorState(int id, boolean visible) {
++        if (connectionListener != null) {
++            connectionListener.rdSetCursorState(id, visible);
++        }
++    }
++
++    public static native void rdSetLocalCursorRequested(boolean requested);
++
++    public static native boolean rdIsLocalCursorActive();
++
++    // percent 0-100 or 255; flags: 1 discharging, 2 charging, 4 no battery; minutesLeft 0xFFFF unknown
++    public static native int rdSendBatteryStatus(int percent, int flags, int minutesLeft, String deviceName);
++
+     public static void bridgeClSetControllerLED(short controllerNumber, byte r, byte g, byte b) {
+         if (connectionListener != null) {
+             connectionListener.setControllerLED(controllerNumber, r, g, b);
+diff --git a/app/src/main/jni/moonlight-core/callbacks.c b/app/src/main/jni/moonlight-core/callbacks.c
+index b9be691..1c850b6 100644
+--- a/app/src/main/jni/moonlight-core/callbacks.c
++++ b/app/src/main/jni/moonlight-core/callbacks.c
+@@ -38,6 +38,8 @@ static jmethodID BridgeClSetHdrModeMethod;
+ static jmethodID BridgeClRumbleTriggersMethod;
+ static jmethodID BridgeClSetMotionEventStateMethod;
+ static jmethodID BridgeClSetControllerLEDMethod;
++static jmethodID BridgeClRdSetCursorShapeMethod;
++static jmethodID BridgeClRdSetCursorStateMethod;
+ static jbyteArray DecodedFrameBuffer;
+ static jshortArray DecodedAudioBuffer;
+ 
+@@ -102,6 +104,8 @@ Java_com_limelight_nvstream_jni_MoonBridge_init(JNIEnv *env, jclass clazz) {
+     BridgeClRumbleTriggersMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClRumbleTriggers", "(SSS)V");
+     BridgeClSetMotionEventStateMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClSetMotionEventState", "(SBS)V");
+     BridgeClSetControllerLEDMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClSetControllerLED", "(SBBB)V");
++    BridgeClRdSetCursorShapeMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClRdSetCursorShape", "(ISSSS[B)V");
++    BridgeClRdSetCursorStateMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClRdSetCursorState", "(IZ)V");
+ }
+ 
+ int BridgeDrSetup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
+@@ -389,6 +393,53 @@ void BridgeClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, u
+     }
+ }
+ 
++// RD extension: client-drawn cursor
++void BridgeClRdSetCursorShape(uint32_t id, uint16_t width, uint16_t height, uint16_t hotX, uint16_t hotY, const uint8_t* bgra) {
++    JNIEnv* env = GetThreadEnv();
++    jsize len = (jsize)width * height * 4;
++    jbyteArray data = (*env)->NewByteArray(env, len);
++    if (data == NULL) {
++        return;
++    }
++    (*env)->SetByteArrayRegion(env, data, 0, len, (const jbyte*)bgra);
++    (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeClRdSetCursorShapeMethod, (jint)id,
++                                 (jshort)width, (jshort)height, (jshort)hotX, (jshort)hotY, data);
++    (*env)->DeleteLocalRef(env, data);
++    if ((*env)->ExceptionCheck(env)) {
++        // We will crash here
++        (*JVM)->DetachCurrentThread(JVM);
++    }
++}
++
++void BridgeClRdSetCursorState(uint32_t id, bool visible) {
++    JNIEnv* env = GetThreadEnv();
++    (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeClRdSetCursorStateMethod, (jint)id, (jboolean)visible);
++    if ((*env)->ExceptionCheck(env)) {
++        // We will crash here
++        (*JVM)->DetachCurrentThread(JVM);
++    }
++}
++
++JNIEXPORT void JNICALL
++Java_com_limelight_nvstream_jni_MoonBridge_rdSetLocalCursorRequested(JNIEnv *env, jclass clazz, jboolean requested) {
++    LiRdSetLocalCursorRequested(requested);
++}
++
++JNIEXPORT jboolean JNICALL
++Java_com_limelight_nvstream_jni_MoonBridge_rdIsLocalCursorActive(JNIEnv *env, jclass clazz) {
++    return LiRdIsLocalCursorActive();
++}
++
++JNIEXPORT jint JNICALL
++Java_com_limelight_nvstream_jni_MoonBridge_rdSendBatteryStatus(JNIEnv *env, jclass clazz, jint percent, jint flags, jint minutesLeft, jstring deviceName) {
++    const char* name = deviceName ? (*env)->GetStringUTFChars(env, deviceName, NULL) : NULL;
++    int ret = LiRdSendBatteryStatus((uint8_t)percent, (uint8_t)flags, (uint16_t)minutesLeft, name);
++    if (name) {
++        (*env)->ReleaseStringUTFChars(env, deviceName, name);
++    }
++    return ret;
++}
++
+ void BridgeClLogMessage(const char* format, ...) {
+     va_list va;
+     va_start(va, format);
+@@ -426,6 +477,8 @@ static CONNECTION_LISTENER_CALLBACKS BridgeConnListenerCallbacks = {
+         .rumbleTriggers = BridgeClRumbleTriggers,
+         .setMotionEventState = BridgeClSetMotionEventState,
+         .setControllerLED = BridgeClSetControllerLED,
++        .rdSetCursorShape = BridgeClRdSetCursorShape,
++        .rdSetCursorState = BridgeClRdSetCursorState,
+ };
+ 
+ static bool
+-- 
+2.55.0.windows.3
+

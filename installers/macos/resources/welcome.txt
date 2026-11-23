@@ -1,0 +1,7 @@
+RD Client for macOS
+
+Installs RD Moonlight in Applications. It replaces a stock Moonlight.app if there is one.
+
+RD Moonlight adds: client-drawn cursor, device profiles (resolution, monitors, FPS), network rules, battery level on the host taskbar, and Wake PC through the smart outlet.
+
+USB passthrough is not available on macOS.

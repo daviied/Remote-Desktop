@@ -1,0 +1,25 @@
+# WireGuard mode (your own tunnel): docker compose up -d                 -> rd-power only
+# Tailscale mode:                     docker compose --profile tailscale up -d
+services:
+  rd-coordinator:
+    profiles: ["tailscale"]
+    image: ghcr.io/daviied/rd-coordinator:latest
+    container_name: rd-coordinator
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"   # nginx proxies HTTPS to this
+      - "3478:3478/udp"         # STUN: forward UDP 3478 on your router
+    volumes:
+      - ${DATA_DIR:-./data}:/var/lib/headscale
+
+  # Smart-outlet power control (optional). nginx proxies /power/ to this.
+  rd-power:
+    image: ghcr.io/daviied/rd-power:latest
+    container_name: rd-power
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HEADSCALE_URL: http://rd-coordinator:8080
+    ports:
+      - "127.0.0.1:8090:8090"

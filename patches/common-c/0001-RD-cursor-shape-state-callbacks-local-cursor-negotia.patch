@@ -1,0 +1,214 @@
+From 04802a65a38adee6745493abcd2bc1a296a17004 Mon Sep 17 00:00:00 2001
+From: rd <rd@local>
+Date: Mon, 23 Nov 2026 14:44:07 -0600
+Subject: [PATCH] RD: cursor shape/state callbacks, local cursor negotiation,
+ client battery
+
+---
+ src/ControlStream.c      | 60 +++++++++++++++++++++++++++++++++++++++-
+ src/FakeCallbacks.c      | 10 +++++++
+ src/Limelight-internal.h |  7 ++++-
+ src/Limelight.h          | 25 +++++++++++++++++
+ src/SdpGenerator.c       |  3 ++
+ 5 files changed, 103 insertions(+), 2 deletions(-)
+
+diff --git a/src/ControlStream.c b/src/ControlStream.c
+index 3babb7f..4b37659 100644
+--- a/src/ControlStream.c
++++ b/src/ControlStream.c
+@@ -1510,8 +1510,29 @@ static void controlReceiveThreadFunc(void* context) {
+                 PltUnlockMutex(&hdrMutex);
+             }
+ 
++            // RD: cursor messages are handled inline (the client posts them to its UI thread).
++            if (ctlHdr->type == RD_MSG_CURSOR_SHAPE || ctlHdr->type == RD_MSG_CURSOR_STATE) {
++                BYTE_BUFFER bb;
++                uint32_t id = 0;
++
++                BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
++                if (ctlHdr->type == RD_MSG_CURSOR_SHAPE) {
++                    uint16_t w = 0, h = 0, hx = 0, hy = 0;
++                    if (BbGet32(&bb, &id) && BbGet16(&bb, &w) && BbGet16(&bb, &h) && BbGet16(&bb, &hx) && BbGet16(&bb, &hy) &&
++                            w > 0 && h > 0 && w <= 256 && h <= 256 && hx < w && hy < h &&
++                            bb.length - bb.position >= (unsigned int)w * h * 4) {
++                        ListenerCallbacks.rdSetCursorShape(id, w, h, hx, hy, (const uint8_t*)&bb.buffer[bb.position]);
++                    }
++                }
++                else {
++                    uint8_t visible = 0;
++                    if (BbGet32(&bb, &id) && BbGet8(&bb, &visible)) {
++                        ListenerCallbacks.rdSetCursorState(id, visible != 0);
++                    }
++                }
++            }
+             // Process client callbacks in a separate thread
+-            if (needsAsyncCallback(ctlHdr->type)) {
++            else if (needsAsyncCallback(ctlHdr->type)) {
+                 queueAsyncCallback(ctlHdr, packetLength);
+             }
+             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {
+@@ -1907,6 +1928,43 @@ int stopControlStream(void) {
+     return 0;
+ }
+ 
++static bool rdLocalCursorRequested;
++
++void LiRdSetLocalCursorRequested(bool requested) {
++    rdLocalCursorRequested = requested;
++}
++
++bool rdIsLocalCursorNegotiated(void) {
++    return rdLocalCursorRequested && IS_SUNSHINE() && (SunshineFeatureFlags & LI_FF_RD_LOCAL_CURSOR);
++}
++
++bool LiRdIsLocalCursorActive(void) {
++    return rdIsLocalCursorNegotiated();
++}
++
++int LiRdSendBatteryStatus(uint8_t percent, uint8_t flags, uint16_t minutesLeft, const char* deviceName) {
++    uint8_t payload[4 + 64];
++    size_t nameLen = deviceName ? strlen(deviceName) : 0;
++
++    if (!IS_SUNSHINE() || !(SunshineFeatureFlags & LI_FF_RD_LOCAL_CURSOR) || AppVersionQuad[0] < 5 || peer == NULL || stopping) {
++        return -1;
++    }
++
++    if (nameLen > 64) {
++        nameLen = 64;
++    }
++    payload[0] = percent;
++    payload[1] = flags;
++    payload[2] = (uint8_t)(minutesLeft & 0xFF);
++    payload[3] = (uint8_t)(minutesLeft >> 8);
++    if (nameLen) {
++        memcpy(&payload[4], deviceName, nameLen);
++    }
++
++    return sendMessageAndForget(RD_MSG_CLIENT_BATTERY, (unsigned int)(4 + nameLen), payload,
++                                CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false) ? 0 : -1;
++}
++
+ // Called by the input stream to send a packet for Gen 5+ servers
+ int sendInputPacketOnControlStream(unsigned char* data, unsigned int length, uint8_t channelId, uint32_t flags, bool moreData) {
+     LC_ASSERT(AppVersionQuad[0] >= 5);
+diff --git a/src/FakeCallbacks.c b/src/FakeCallbacks.c
+index 29fdf18..cf18e50 100644
+--- a/src/FakeCallbacks.c
++++ b/src/FakeCallbacks.c
+@@ -41,6 +41,8 @@ static void fakeClRumbleTriggers(uint16_t controllerNumber, uint16_t leftTrigger
+ static void fakeClSetMotionEventState(uint16_t controllerNumber, uint8_t motionType, uint16_t reportRateHz) {}
+ static void fakeClSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right) {};
+ static void fakeClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b) {}
++static void fakeClRdSetCursorShape(uint32_t id, uint16_t width, uint16_t height, uint16_t hotX, uint16_t hotY, const uint8_t* bgra) {}
++static void fakeClRdSetCursorState(uint32_t id, bool visible) {}
+ 
+ static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
+     .stageStarting = fakeClStageStarting,
+@@ -56,6 +58,8 @@ static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
+     .setMotionEventState = fakeClSetMotionEventState,
+     .setControllerLED = fakeClSetControllerLED,
+     .setAdaptiveTriggers = fakeClSetAdaptiveTriggers,
++    .rdSetCursorShape = fakeClRdSetCursorShape,
++    .rdSetCursorState = fakeClRdSetCursorState,
+ };
+ 
+ void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
+@@ -146,5 +150,11 @@ void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_REND
+         if ((*clCallbacks)->setAdaptiveTriggers == NULL) {
+             (*clCallbacks)->setAdaptiveTriggers = fakeClSetAdaptiveTriggers;
+         }
++        if ((*clCallbacks)->rdSetCursorShape == NULL) {
++            (*clCallbacks)->rdSetCursorShape = fakeClRdSetCursorShape;
++        }
++        if ((*clCallbacks)->rdSetCursorState == NULL) {
++            (*clCallbacks)->rdSetCursorState = fakeClRdSetCursorState;
++        }
+     }
+ }
+diff --git a/src/Limelight-internal.h b/src/Limelight-internal.h
+index d41a55c..196abe3 100644
+--- a/src/Limelight-internal.h
++++ b/src/Limelight-internal.h
+@@ -86,7 +86,12 @@ extern uint32_t EncryptionFeaturesEnabled;
+ 
+ // Client feature flags for x-ml-general.featureFlags SDP attribute
+ #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
+-#define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
++#define ML_FF_SESSION_ID_V1 0x02
++// RD extension
++#define RD_MSG_CURSOR_SHAPE   0x55F0
++#define RD_MSG_CURSOR_STATE   0x55F1
++#define RD_MSG_CLIENT_BATTERY 0x55F2
++bool rdIsLocalCursorNegotiated(void); // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
+ 
+ #define UDP_RECV_POLL_TIMEOUT_MS 100
+ 
+diff --git a/src/Limelight.h b/src/Limelight.h
+index e471390..b9d6c1c 100644
+--- a/src/Limelight.h
++++ b/src/Limelight.h
+@@ -491,6 +491,14 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
+ // This callback is invoked to set a controller's RGB LED (if present).
+ typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
+ 
++// RD extension: the host sent a new cursor image. bgra is width*height*4 bytes of
++// straight-alpha BGRA. Clients cache shapes by id. Called on the control receive thread.
++typedef void(*ConnListenerRdSetCursorShape)(uint32_t id, uint16_t width, uint16_t height, uint16_t hotX, uint16_t hotY, const uint8_t* bgra);
++
++// RD extension: the host cursor shape id or visibility changed. When visible is false,
++// an app hid the cursor (often a game capturing the mouse). Called on the control receive thread.
++typedef void(*ConnListenerRdSetCursorState)(uint32_t id, bool visible);
++
+ typedef struct _CONNECTION_LISTENER_CALLBACKS {
+     ConnListenerStageStarting stageStarting;
+     ConnListenerStageComplete stageComplete;
+@@ -505,6 +513,8 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
+     ConnListenerSetMotionEventState setMotionEventState;
+     ConnListenerSetControllerLED setControllerLED;
+     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
++    ConnListenerRdSetCursorShape rdSetCursorShape;
++    ConnListenerRdSetCursorState rdSetCursorState;
+ } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
+ 
+ // Use this function to zero the connection callbacks when allocated on the stack or heap
+@@ -1025,8 +1035,23 @@ void LiRequestIdrFrame(void);
+ // This function returns any extended feature flags supported by the host.
+ #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
+ #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
++#define LI_FF_RD_LOCAL_CURSOR         0x40000000 // RD host: cursor shape messages + client battery
+ uint32_t LiGetHostFeatureFlags(void);
+ 
++// RD extension: call before LiStartConnection(). When true and the host supports it,
++// the host stops drawing the cursor into the video and sends cursor shapes instead.
++void LiRdSetLocalCursorRequested(bool requested);
++
++// RD extension: true when the current session negotiated client-drawn cursor.
++bool LiRdIsLocalCursorActive(void);
++
++// RD extension: report client battery to the host (shown in the host tray).
++// percent: 0-100, or 255 if unknown. flags: RD_BATT_*. minutesLeft: 0xFFFF if unknown.
++#define RD_BATT_DISCHARGING 0x01
++#define RD_BATT_CHARGING    0x02
++#define RD_BATT_NO_BATTERY  0x04
++int LiRdSendBatteryStatus(uint8_t percent, uint8_t flags, uint16_t minutesLeft, const char* deviceName);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/SdpGenerator.c b/src/SdpGenerator.c
+index 0ca207f..602409d 100644
+--- a/src/SdpGenerator.c
++++ b/src/SdpGenerator.c
+@@ -271,6 +271,9 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
+     if (IS_SUNSHINE()) {
+         // Send client feature flags to Sunshine hosts
+         uint32_t moonlightFeatureFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;
++        if (rdIsLocalCursorNegotiated()) {
++            moonlightFeatureFlags |= LI_FF_RD_LOCAL_CURSOR;
++        }
+         snprintf(payloadStr, sizeof(payloadStr), "%" PRIu32, moonlightFeatureFlags);
+         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
+ 
+-- 
+2.55.0.windows.3
+

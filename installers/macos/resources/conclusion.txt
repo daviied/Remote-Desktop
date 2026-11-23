@@ -1,0 +1,6 @@
+Done. Next:
+
+1. Connect your WireGuard tunnel to home (or Tailscale, if you use that mode).
+2. Open Moonlight -> Add PC -> the host LAN IP (e.g. 192.168.1.20).
+3. Pair: Moonlight shows a PIN. Enter it in the host web UI (https://localhost:47990 on the host).
+4. Settings -> Profiles & network rules: make a default profile for this Mac. Add the power server URL and token for Wake PC.

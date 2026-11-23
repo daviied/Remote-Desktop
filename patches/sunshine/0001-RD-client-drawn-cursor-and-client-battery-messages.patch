@@ -1,0 +1,467 @@
+From 61170908e855270ec9a15ef266daac567ded2e50 Mon Sep 17 00:00:00 2001
+From: rd <rd@local>
+Date: Mon, 23 Nov 2026 14:42:38 -0600
+Subject: [PATCH] RD: client-drawn cursor and client battery messages
+
+---
+ cmake/compile_definitions/common.cmake |   1 +
+ src/platform/windows/display_vram.cpp  |   9 +-
+ src/rd_cursor.cpp                      | 153 +++++++++++++++++++++++++
+ src/rd_cursor.h                        |  65 +++++++++++
+ src/rtsp.cpp                           |   3 +-
+ src/stream.cpp                         |  82 ++++++++++++-
+ 6 files changed, 310 insertions(+), 3 deletions(-)
+ create mode 100644 src/rd_cursor.cpp
+ create mode 100644 src/rd_cursor.h
+
+diff --git a/cmake/compile_definitions/common.cmake b/cmake/compile_definitions/common.cmake
+index 8219564..45f342c 100644
+--- a/cmake/compile_definitions/common.cmake
++++ b/cmake/compile_definitions/common.cmake
+@@ -168,6 +168,7 @@ set(SUNSHINE_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/compat/moonlight.h"
+         "${CMAKE_SOURCE_DIR}/src/rtsp.cpp"
+         "${CMAKE_SOURCE_DIR}/src/rtsp.h"
++        "${CMAKE_SOURCE_DIR}/src/rd_cursor.cpp"
+         "${CMAKE_SOURCE_DIR}/src/stream.cpp"
+         "${CMAKE_SOURCE_DIR}/src/stream.h"
+         "${CMAKE_SOURCE_DIR}/src/video.cpp"
+diff --git a/src/platform/windows/display_vram.cpp b/src/platform/windows/display_vram.cpp
+index 917c5c3..5fb5343 100644
+--- a/src/platform/windows/display_vram.cpp
++++ b/src/platform/windows/display_vram.cpp
+@@ -23,6 +23,7 @@ extern "C" {
+ 
+ // local includes
+ #include "display.h"
++#include "src/rd_cursor.h"
+ #include "misc.h"
+ #include "src/config.h"
+ #include "src/logging.h"
+@@ -1405,6 +1406,9 @@ namespace platf::dxgi {
+       auto alpha_cursor_img = make_cursor_alpha_image(img_data, shape_info);
+       auto xor_cursor_img = make_cursor_xor_image(img_data, shape_info);
+ 
++      // RD: share the shape so clients can draw the cursor locally.
++      rd_cursor::publish_shape(shape_info.Width, shape_info.HotSpot.x, shape_info.HotSpot.y, std::begin(alpha_cursor_img), alpha_cursor_img.size(), xor_cursor_img.size() ? std::begin(xor_cursor_img) : nullptr, xor_cursor_img.size());
++
+       if (!set_cursor_texture(device.get(), cursor_alpha, std::move(alpha_cursor_img), shape_info) || !set_cursor_texture(device.get(), cursor_xor, std::move(xor_cursor_img), shape_info)) {
+         return capture_e::capture_error;
+       }
+@@ -1414,9 +1418,12 @@ namespace platf::dxgi {
+       cursor_alpha.set_pos(frame_info.PointerPosition.Position.x, frame_info.PointerPosition.Position.y, width, height, display_rotation, frame_info.PointerPosition.Visible);
+ 
+       cursor_xor.set_pos(frame_info.PointerPosition.Position.x, frame_info.PointerPosition.Position.y, width, height, display_rotation, frame_info.PointerPosition.Visible);
++
++      rd_cursor::publish_visible(frame_info.PointerPosition.Visible);
+     }
+ 
+-    const bool blend_mouse_cursor_flag = (cursor_alpha.visible || cursor_xor.visible) && cursor_visible;
++    // RD: skip blending while a client draws the cursor locally.
++    const bool blend_mouse_cursor_flag = (cursor_alpha.visible || cursor_xor.visible) && cursor_visible && rd_cursor::local_sessions.load(std::memory_order_relaxed) == 0;
+ 
+     texture2d_t src {};
+     if (frame_update_flag) {
+diff --git a/src/rd_cursor.cpp b/src/rd_cursor.cpp
+new file mode 100644
+index 0000000..6424e3e
+--- /dev/null
++++ b/src/rd_cursor.cpp
+@@ -0,0 +1,153 @@
++/**
++ * @file src/rd_cursor.cpp
++ * @brief RD extension: share the host cursor shape so clients can draw it locally.
++ */
++#include "rd_cursor.h"
++
++#include <algorithm>
++#include <cctype>
++#include <chrono>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <mutex>
++
++namespace rd_cursor {
++  std::atomic<int> local_sessions {0};
++
++  namespace {
++    std::mutex mtx;
++    snapshot_t state {0, nullptr, false};
++
++    std::uint32_t fnv1a(const std::vector<std::uint8_t> &data, std::uint32_t seed) {
++      std::uint32_t h = 2166136261u ^ seed;
++      for (auto b : data) {
++        h = (h ^ b) * 16777619u;
++      }
++      return h ? h : 1;
++    }
++  }  // namespace
++
++  void publish_shape(std::uint32_t width, std::uint32_t hot_x, std::uint32_t hot_y, const std::uint8_t *alpha, std::size_t alpha_size, const std::uint8_t *xor_img, std::size_t xor_size) {
++    if (width == 0 || !alpha || alpha_size < (std::size_t) width * 4) {
++      return;
++    }
++    std::uint32_t height = (std::uint32_t) (alpha_size / ((std::size_t) width * 4));
++
++    // Merge: alpha image as-is; XOR pixels (inverting, e.g. text I-beam) become opaque black,
++    // since client OS cursors cannot XOR with the stream image.
++    std::vector<std::uint8_t> merged(alpha, alpha + (std::size_t) width * height * 4);
++    if (xor_img && xor_size >= merged.size()) {
++      for (std::size_t i = 0; i < merged.size(); i += 4) {
++        const bool xor_on = xor_img[i] | xor_img[i + 1] | xor_img[i + 2];
++        if (xor_on && xor_img[i + 3]) {
++          merged[i] = merged[i + 1] = merged[i + 2] = 0x00;
++          merged[i + 3] = 0xFF;
++        }
++      }
++    }
++
++    // Downscale (nearest neighbour) if too big.
++    auto shape = std::make_shared<shape_t>();
++    const std::uint32_t edge = std::max(width, height);
++    if (edge > MAX_EDGE) {
++      const double s = (double) MAX_EDGE / edge;
++      const std::uint32_t nw = std::max<std::uint32_t>(1, (std::uint32_t) (width * s));
++      const std::uint32_t nh = std::max<std::uint32_t>(1, (std::uint32_t) (height * s));
++      std::vector<std::uint8_t> scaled((std::size_t) nw * nh * 4);
++      for (std::uint32_t y = 0; y < nh; ++y) {
++        for (std::uint32_t x = 0; x < nw; ++x) {
++          const std::uint32_t sx = std::min(width - 1, (std::uint32_t) (x / s));
++          const std::uint32_t sy = std::min(height - 1, (std::uint32_t) (y / s));
++          std::copy_n(&merged[((std::size_t) sy * width + sx) * 4], 4, &scaled[((std::size_t) y * nw + x) * 4]);
++        }
++      }
++      merged = std::move(scaled);
++      hot_x = (std::uint32_t) (hot_x * s);
++      hot_y = (std::uint32_t) (hot_y * s);
++      width = nw;
++      height = nh;
++    }
++
++    shape->width = (std::uint16_t) width;
++    shape->height = (std::uint16_t) height;
++    shape->hot_x = (std::uint16_t) std::min(hot_x, width - 1);
++    shape->hot_y = (std::uint16_t) std::min(hot_y, height - 1);
++    shape->id = fnv1a(merged, (width << 16) ^ height ^ (shape->hot_x << 8) ^ (shape->hot_y << 24));
++    shape->bgra = std::move(merged);
++
++    std::lock_guard lg {mtx};
++    if (state.shape && state.shape->id == shape->id) {
++      return;
++    }
++    state.shape = std::move(shape);
++    ++state.seq;
++  }
++
++  void publish_visible(bool visible) {
++    std::lock_guard lg {mtx};
++    if (state.visible != visible) {
++      state.visible = visible;
++      ++state.seq;
++    }
++  }
++
++  snapshot_t get() {
++    std::lock_guard lg {mtx};
++    return state;
++  }
++
++  namespace {
++    std::filesystem::path battery_path(const std::string &instance) {
++      const char *pd = std::getenv("ProgramData");
++      std::filesystem::path dir = std::filesystem::path(pd ? pd : "C:/ProgramData") / "RD" / "clients";
++      std::string safe;
++      for (char c : instance) {
++        safe += (std::isalnum((unsigned char) c) || c == '-' || c == '_') ? c : '_';
++      }
++      return dir / (safe.empty() ? "default.txt" : safe + ".txt");
++    }
++  }  // namespace
++
++  void write_battery(const std::string &instance, const std::string_view &payload) {
++    if (payload.size() < 4) {
++      return;
++    }
++    auto p = (const std::uint8_t *) payload.data();
++    unsigned percent = p[0];
++    unsigned flags = p[1];
++    unsigned minutes = p[2] | (p[3] << 8);
++    std::string name;
++    for (std::size_t i = 4; i < payload.size() && name.size() < 64; ++i) {
++      char c = payload[i];
++      if (c != '\n' && c != '\r' && c != '\0') {
++        name += c;
++      }
++    }
++
++    std::error_code ec;
++    auto path = battery_path(instance);
++    std::filesystem::create_directories(path.parent_path(), ec);
++    auto tmp = path;
++    tmp += ".tmp";
++    {
++      std::ofstream f(tmp, std::ios::trunc);
++      if (!f) {
++        return;
++      }
++      auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
++      f << "instance=" << instance << '\n'
++        << "name=" << name << '\n'
++        << "percent=" << percent << '\n'
++        << "flags=" << flags << '\n'
++        << "minutes=" << minutes << '\n'
++        << "time=" << now << '\n';
++    }
++    std::filesystem::rename(tmp, path, ec);
++  }
++
++  void clear_battery(const std::string &instance) {
++    std::error_code ec;
++    std::filesystem::remove(battery_path(instance), ec);
++  }
++}  // namespace rd_cursor
+diff --git a/src/rd_cursor.h b/src/rd_cursor.h
+new file mode 100644
+index 0000000..782c9ac
+--- /dev/null
++++ b/src/rd_cursor.h
+@@ -0,0 +1,65 @@
++/**
++ * @file src/rd_cursor.h
++ * @brief RD extension: share the host cursor shape so clients can draw it locally.
++ */
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace rd_cursor {
++  /// Host advertises this in x-ss-general.featureFlags; client echoes it in x-ml-general.featureFlags.
++  constexpr std::uint32_t FEATURE_LOCAL_CURSOR = 0x40000000;
++  /// Largest cursor edge sent to clients. Bigger cursors are downscaled.
++  constexpr std::uint16_t MAX_EDGE = 96;  // keeps one control message under 64 KiB
++
++  /// Control-stream message types (Sunshine extension range 0x55xx).
++  constexpr std::uint16_t MSG_CURSOR_SHAPE = 0x55F0;  ///< u32 id, u16 w, u16 h, u16 hot_x, u16 hot_y, BGRA[w*h]
++  constexpr std::uint16_t MSG_CURSOR_STATE = 0x55F1;  ///< u32 id, u8 visible, u8[3] reserved
++  /// Client -> host: u8 percent (255 unknown), u8 flags (1 discharging, 2 charging, 4 no battery), u16 minutes left (0xFFFF unknown), UTF-8 device name.
++  constexpr std::uint16_t MSG_CLIENT_BATTERY = 0x55F2;
++
++  /**
++   * @brief Write the client battery state for the host tray helper.
++   * File: %ProgramData%\RD\clients\<instance>.txt (removed when the session ends).
++   */
++  void write_battery(const std::string &instance, const std::string_view &payload);
++  void clear_battery(const std::string &instance);
++
++  struct shape_t {
++    std::uint32_t id;  ///< Hash of the image; clients cache by id.
++    std::uint16_t width;
++    std::uint16_t height;
++    std::uint16_t hot_x;
++    std::uint16_t hot_y;
++    std::vector<std::uint8_t> bgra;  ///< Straight-alpha BGRA, width * height * 4 bytes.
++  };
++
++  struct snapshot_t {
++    std::uint64_t seq;  ///< Changes every time shape or visibility changes.
++    std::shared_ptr<const shape_t> shape;
++    bool visible;
++  };
++
++  /**
++   * @brief Publish a new cursor shape from capture.
++   * @param alpha Alpha-blend image from make_cursor_alpha_image().
++   * @param xor_img XOR image from make_cursor_xor_image() (may be empty).
++   * Height is derived from alpha_size / (width * 4).
++   */
++  void publish_shape(std::uint32_t width, std::uint32_t hot_x, std::uint32_t hot_y, const std::uint8_t *alpha, std::size_t alpha_size, const std::uint8_t *xor_img, std::size_t xor_size);
++
++  /// Publish pointer visibility from capture.
++  void publish_visible(bool visible);
++
++  /// Read the latest state (thread safe).
++  snapshot_t get();
++
++  /// Number of sessions that draw the cursor on the client. While > 0, capture must not blend the cursor.
++  extern std::atomic<int> local_sessions;
++}  // namespace rd_cursor
+diff --git a/src/rtsp.cpp b/src/rtsp.cpp
+index c3e6b37..583ad5a 100644
+--- a/src/rtsp.cpp
++++ b/src/rtsp.cpp
+@@ -29,6 +29,7 @@ extern "C" {
+ #include "logging.h"
+ #include "network.h"
+ #include "nvhttp.h"
++#include "rd_cursor.h"
+ #include "rtsp.h"
+ #include "stream.h"
+ #include "sync.h"
+@@ -894,7 +895,7 @@ namespace rtsp_stream {
+     std::stringstream ss;
+ 
+     // Tell the client about our supported features
+-    ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
++    ss << "a=x-ss-general.featureFlags:" << ((uint32_t) platf::get_capabilities() | rd_cursor::FEATURE_LOCAL_CURSOR) << std::endl;
+ 
+     // Always request new control stream encryption if the client supports it
+     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
+diff --git a/src/stream.cpp b/src/stream.cpp
+index a222b40..53dd784 100644
+--- a/src/stream.cpp
++++ b/src/stream.cpp
+@@ -29,6 +29,7 @@
+ #include "network.h"
+ #include "platform/common.h"
+ #include "process.h"
++#include "rd_cursor.h"
+ #include "stream.h"
+ #include "sync.h"
+ #include "system_tray.h"
+@@ -558,6 +559,10 @@ namespace stream {
+ 
+       platf::feedback_queue_t feedback_queue;  ///< Queue of controller feedback awaiting control-channel delivery.
+       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;  ///< Queue of HDR metadata awaiting control-channel delivery.
++
++      bool rd_local_cursor = false;  ///< RD: client draws the cursor itself.
++      std::uint64_t rd_cursor_seq = 0;  ///< RD: last cursor state sequence sent.
++      std::uint32_t rd_cursor_sent_id = 0;  ///< RD: last cursor shape id sent.
+     } control;  ///< Runtime state for the encrypted GameStream control channel.
+ 
+     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
+@@ -1184,6 +1189,55 @@ namespace stream {
+     return 0;
+   }
+ 
++  /**
++   * @brief RD: send cursor shape (if changed) and visibility to a local-cursor client.
++   */
++  void send_rd_cursor(session_t *session, const rd_cursor::snapshot_t &snap) {
++    static std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(4 + 12 + rd_cursor::MAX_EDGE * rd_cursor::MAX_EDGE * 4) + crypto::cipher::tag_size> encrypted_payload;
++
++    auto send_msg = [&](std::uint16_t type, const std::vector<std::uint8_t> &body) {
++      std::vector<std::uint8_t> msg(4 + body.size());
++      msg[0] = type & 0xFF;
++      msg[1] = type >> 8;
++      msg[2] = body.size() & 0xFF;
++      msg[3] = (body.size() >> 8) & 0xFF;
++      std::copy(body.begin(), body.end(), msg.begin() + 4);
++      auto payload = encode_control(session, std::string_view {(const char *) msg.data(), msg.size()}, encrypted_payload);
++      if (payload.empty() || session->broadcast_ref->control_server.send(payload, session->control.peer)) {
++        BOOST_LOG(warning) << "RD: couldn't send cursor message"sv;
++      }
++    };
++    auto put16 = [](std::vector<std::uint8_t> &v, std::uint16_t x) {
++      v.push_back(x & 0xFF);
++      v.push_back(x >> 8);
++    };
++    auto put32 = [&](std::vector<std::uint8_t> &v, std::uint32_t x) {
++      put16(v, x & 0xFFFF);
++      put16(v, x >> 16);
++    };
++
++    std::uint32_t id = snap.shape ? snap.shape->id : 0;
++    if (snap.shape && id != session->control.rd_cursor_sent_id) {
++      std::vector<std::uint8_t> body;
++      body.reserve(12 + snap.shape->bgra.size());
++      put32(body, id);
++      put16(body, snap.shape->width);
++      put16(body, snap.shape->height);
++      put16(body, snap.shape->hot_x);
++      put16(body, snap.shape->hot_y);
++      body.insert(body.end(), snap.shape->bgra.begin(), snap.shape->bgra.end());
++      send_msg(rd_cursor::MSG_CURSOR_SHAPE, body);
++      session->control.rd_cursor_sent_id = id;
++    }
++
++    std::vector<std::uint8_t> state;
++    put32(state, id);
++    state.push_back(snap.visible ? 1 : 0);
++    state.insert(state.end(), 3, 0);
++    send_msg(rd_cursor::MSG_CURSOR_STATE, state);
++    session->control.rd_cursor_seq = snap.seq;
++  }
++
+   /**
+    * @brief Run the broadcast control-channel worker thread.
+    *
+@@ -1194,6 +1248,11 @@ namespace stream {
+       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
+     });
+ 
++    // RD: client battery level for the host tray icon.
++    server->map(rd_cursor::MSG_CLIENT_BATTERY, [&](session_t *session, const std::string_view &payload) {
++      rd_cursor::write_battery(config::nvhttp.sunshine_name, payload);
++    });
++
+     server->map(packetTypes[IDX_START_A], [&](session_t *session, const std::string_view &payload) {
+       BOOST_LOG(debug) << "type [IDX_START_A]"sv;
+     });
+@@ -1340,6 +1399,7 @@ namespace stream {
+     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
+     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
+       bool has_session_awaiting_peer = false;
++      bool has_local_cursor = false;
+ 
+       {
+         auto lg = server->_sessions.lock();
+@@ -1395,6 +1455,13 @@ namespace stream {
+ 
+               send_hdr_mode(session, std::move(hdr_info));
+             }
++
++            if (session->control.rd_local_cursor) {
++              has_local_cursor = true;
++              if (auto snap = rd_cursor::get(); snap.seq != session->control.rd_cursor_seq) {
++                send_rd_cursor(session, snap);
++              }
++            }
+           }
+ 
+           ++pos;
+@@ -1407,7 +1474,8 @@ namespace stream {
+         break;
+       }
+ 
+-      server->iterate(150ms);
++      // RD: poll fast while a client draws the cursor so shape changes arrive quickly.
++      server->iterate(has_local_cursor ? 4ms : 150ms);
+     }
+ 
+     // Let all remaining connections know the server is shutting down
+@@ -2316,6 +2384,11 @@ namespace stream {
+       BOOST_LOG(debug) << "Resetting Input..."sv;
+       input::reset(session.input);
+ 
++      if (session.control.rd_local_cursor) {
++        --rd_cursor::local_sessions;
++      }
++      rd_cursor::clear_battery(config::nvhttp.sunshine_name);
++
+       // If this is the last session, invoke the platform callbacks
+       if (--running_sessions == 0) {
+         bool revert_display_config {config::video.dd.config_revert_on_disconnect};
+@@ -2368,6 +2441,13 @@ namespace stream {
+ 
+       session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
+ 
++      // RD: client draws the cursor; stop blending it into the video.
++      if (session.config.mlFeatureFlags & rd_cursor::FEATURE_LOCAL_CURSOR) {
++        session.control.rd_local_cursor = true;
++        ++rd_cursor::local_sessions;
++        BOOST_LOG(info) << "RD: client-drawn cursor enabled"sv;
++      }
++
+       session.audioThread = std::jthread {audioThread, &session};
+       session.videoThread = std::jthread {videoThread, &session};
+ 
+-- 
+2.55.0.windows.3
+

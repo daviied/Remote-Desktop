@@ -1,0 +1,21 @@
+RD Host setup
+
+Before you continue:
+
+1. Install Virtual Display Driver (3 monitors) and add every resolution and refresh rate your clients use:
+   https://github.com/VirtualDrivers/Virtual-Display-Driver
+
+2. Optional, for USB passthrough: install usbip-win2:
+   https://github.com/vadimgrn/usbip-win2/releases
+
+3. Give this PC a fixed LAN IP (DHCP reservation on your router).
+
+4. WireGuard mode: your tunnel must route (no NAT) into the LAN, so this PC sees each client's tunnel IP.
+
+This installer:
+ - installs RD Sunshine (3 instances, one per virtual display), NVENC low latency, mandatory encryption
+ - installs rd-hostd (virtual displays per client, battery icons in the taskbar)
+ - opens the firewall only for the networks you allow
+ - optional: USB passthrough agent and smart-outlet power notice
+
+At the end it shows the host address and USB token for the client installers.

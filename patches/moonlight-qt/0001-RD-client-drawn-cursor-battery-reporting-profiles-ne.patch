@@ -1,0 +1,1380 @@
+From d64bd85047c5cd7972d88ec467562d567a347ac8 Mon Sep 17 00:00:00 2001
+From: rd <rd@local>
+Date: Mon, 23 Nov 2026 14:50:46 -0600
+Subject: [PATCH 1/3] RD: client-drawn cursor, battery reporting, profiles,
+ network rules, multi-monitor
+
+---
+ app/app.pro                           |   3 +
+ app/cli/commandlineparser.cpp         |   8 +
+ app/gui/RdProfilesView.qml            | 209 ++++++++++++++
+ app/gui/main.qml                      |  24 ++
+ app/main.cpp                          |   7 +
+ app/qml.qrc                           |   1 +
+ app/rd/rdprofiles.cpp                 | 394 ++++++++++++++++++++++++++
+ app/rd/rdprofiles.h                   | 100 +++++++
+ app/settings/streamingpreferences.cpp |   7 +
+ app/settings/streamingpreferences.h   |   3 +
+ app/streaming/input/input.cpp         |   6 +
+ app/streaming/input/input.h           |  21 ++
+ app/streaming/input/mouse.cpp         |   4 +
+ app/streaming/input/rdcursor.cpp      | 162 +++++++++++
+ app/streaming/session.cpp             | 108 ++++++-
+ app/streaming/session.h               |  11 +
+ 16 files changed, 1067 insertions(+), 1 deletion(-)
+ create mode 100644 app/gui/RdProfilesView.qml
+ create mode 100644 app/rd/rdprofiles.cpp
+ create mode 100644 app/rd/rdprofiles.h
+ create mode 100644 app/streaming/input/rdcursor.cpp
+
+diff --git a/app/app.pro b/app/app.pro
+index 1c0661b..b942977 100644
+--- a/app/app.pro
++++ b/app/app.pro
+@@ -191,6 +191,8 @@ SOURCES += \
+     streaming/input/keyboard.cpp \
+     streaming/input/mouse.cpp \
+     streaming/input/reltouch.cpp \
++    streaming/input/rdcursor.cpp \
++    rd/rdprofiles.cpp \
+     streaming/session.cpp \
+     streaming/audio/audio.cpp \
+     streaming/audio/renderers/sdlaud.cpp \
+@@ -229,6 +231,7 @@ HEADERS += \
+     settings/streamingpreferences.h \
+     streaming/input/input.h \
+     streaming/session.h \
++    rd/rdprofiles.h \
+     streaming/audio/renderers/renderer.h \
+     streaming/audio/renderers/sdl.h \
+     gui/computermodel.h \
+diff --git a/app/cli/commandlineparser.cpp b/app/cli/commandlineparser.cpp
+index b733d1c..20f7ab5 100644
+--- a/app/cli/commandlineparser.cpp
++++ b/app/cli/commandlineparser.cpp
+@@ -1,4 +1,5 @@
+ #include "commandlineparser.h"
++#include "rd/rdprofiles.h"
+ 
+ #include <QCommandLineParser>
+ #include <QRegularExpression>
+@@ -371,6 +372,8 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
+     parser.addChoiceOption("capture-system-keys", "capture system key combos", m_CaptureSysKeysModeMap.keys());
+     parser.addChoiceOption("video-codec", "video codec", m_VideoCodecMap.keys());
+     parser.addChoiceOption("video-decoder", "video decoder", m_VideoDecoderMap.keys());
++    parser.addValueOption("rd-profile", "RD: connection profile name");
++    parser.addValueOption("rd-monitor", "RD: monitor index in the profile (used for extra monitors)");
+ 
+     if (!parser.parse(args)) {
+         parser.showError(parser.errorText());
+@@ -378,6 +381,11 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
+ 
+     parser.handleUnknownOptions();
+ 
++    // RD: profile-driven secondary monitor stream
++    if (parser.isSet("rd-monitor")) {
++        RdProfiles::setCliSelection(parser.value("rd-profile"), parser.getIntOption("rd-monitor"));
++    }
++
+     // Resolve display's width and height
+     static QRegularExpression resolutionRexExp("^(720|1080|1440|4K|resolution)$");
+     QStringList resoOptions = parser.optionNames().filter(resolutionRexExp);
+diff --git a/app/gui/RdProfilesView.qml b/app/gui/RdProfilesView.qml
+new file mode 100644
+index 0000000..891a40c
+--- /dev/null
++++ b/app/gui/RdProfilesView.qml
+@@ -0,0 +1,209 @@
++// RD extension: connection profiles + network rules editor.
++import QtQuick 2.9
++import QtQuick.Controls 2.2
++import QtQuick.Layouts 1.2
++
++import RdProfiles 1.0
++
++Flickable {
++    id: page
++    objectName: qsTr("Profiles & Network Rules")
++
++    property var profiles: []
++    property var rules: []
++    property int sel: 0
++    property string defaultName: ""
++    property string netText: ""
++
++    readonly property var codecs: ["auto", "h264", "hevc", "av1"]
++    readonly property var windowModes: ["fullscreen", "borderless", "windowed"]
++    readonly property var matches: ["any", "ethernet", "wifi", "tethered", "cellular"]
++
++    contentWidth: width
++    contentHeight: column.implicitHeight + 40
++    boundsBehavior: Flickable.OvershootBounds
++    ScrollBar.vertical: ScrollBar {}
++
++    function reload() {
++        profiles = JSON.parse(JSON.stringify(RdProfiles.profiles))
++        rules = JSON.parse(JSON.stringify(RdProfiles.rules))
++        defaultName = RdProfiles.defaultProfile
++        sel = Math.max(0, Math.min(sel, profiles.length - 1))
++        netText = RdProfiles.describeNetwork()
++    }
++    function names() { return profiles.map(function(p) { return p.name }) }
++    function refreshProfiles() { profiles = profiles.slice() }
++    function refreshRules() { rules = rules.slice() }
++    function cur() { return profiles.length > 0 ? profiles[sel] : null }
++
++    function setMonitorCount(n) {
++        var p = cur()
++        while (p.monitors.length < n) {
++            var i = p.monitors.length
++            var last = p.monitors[i - 1]
++            p.monitors.push({ width: last.width, height: last.height, fps: last.fps,
++                              port: 47989 + 100 * i, clientDisplay: i })
++        }
++        p.monitors.length = n
++        refreshProfiles()
++    }
++
++    function saveAll() {
++        RdProfiles.profiles = profiles
++        RdProfiles.rules = rules
++        RdProfiles.defaultProfile = defaultName
++        RdProfiles.save()
++        reload()
++    }
++
++    Component.onCompleted: reload()
++
++    ColumnLayout {
++        id: column
++        x: 20; y: 20
++        width: page.width - 40
++        spacing: 10
++
++        // ---------------- Profiles ----------------
++        Label { text: qsTr("Connection profiles"); font.pointSize: 14; font.bold: true }
++        Label {
++            Layout.fillWidth: true; wrapMode: Text.Wrap; font.pointSize: 10
++            text: qsTr("The default profile is used on this device. Pick another one for a single connection from the toolbar. Each extra monitor streams from its own host display (host port 47989 + 100 per monitor).")
++        }
++
++        RowLayout {
++            ComboBox {
++                id: profileCombo
++                Layout.preferredWidth: 260
++                model: page.names()
++                currentIndex: page.sel
++                onActivated: page.sel = index
++            }
++            Button { text: qsTr("Add"); onClicked: { profiles.push(RdProfiles.newProfile(qsTr("Profile %1").arg(profiles.length + 1))); sel = profiles.length - 1; refreshProfiles() } }
++            Button { text: qsTr("Delete"); enabled: profiles.length > 1; onClicked: { profiles.splice(sel, 1); sel = 0; refreshProfiles() } }
++            Button {
++                text: cur() && cur().name === defaultName ? qsTr("Default on this device ✓") : qsTr("Make default on this device")
++                onClicked: defaultName = cur().name
++            }
++        }
++
++        GridLayout {
++            visible: cur() !== null
++            columns: 2
++            columnSpacing: 12
++
++            Label { text: qsTr("Name") }
++            TextField { Layout.preferredWidth: 260; text: cur() ? cur().name : ""
++                onEditingFinished: { var old = cur().name; cur().name = text; if (defaultName === old) defaultName = text; refreshProfiles() } }
++
++            Label { text: qsTr("Bitrate (Mbps, 0 = auto)") }
++            SpinBox { from: 0; to: 500; editable: true; value: cur() ? Math.round(cur().bitrateKbps / 1000) : 0
++                onValueModified: cur().bitrateKbps = value * 1000 }
++
++            Label { text: qsTr("Codec") }
++            ComboBox { model: codecs; currentIndex: cur() ? Math.max(0, codecs.indexOf(cur().codec)) : 0
++                onActivated: cur().codec = codecs[index] }
++
++            Label { text: qsTr("Window mode") }
++            ComboBox { model: windowModes; currentIndex: cur() ? Math.max(0, windowModes.indexOf(cur().windowMode)) : 0
++                onActivated: cur().windowMode = windowModes[index] }
++
++            Label { text: qsTr("HDR") }
++            CheckBox { checked: cur() ? cur().hdr : false; onToggled: cur().hdr = checked }
++
++            Label { text: qsTr("Client-drawn cursor") }
++            CheckBox { checked: cur() ? cur().localCursor !== false : true; onToggled: cur().localCursor = checked }
++
++            Label { text: qsTr("Monitors") }
++            SpinBox { from: 1; to: 3; value: cur() ? cur().monitors.length : 1; onValueModified: setMonitorCount(value) }
++        }
++
++        Repeater {
++            model: cur() ? cur().monitors : []
++            delegate: GroupBox {
++                Layout.fillWidth: true
++                title: qsTr("Monitor %1 (sets the host display resolution)").arg(index + 1)
++                property var mon: modelData
++                property int mi: index
++                GridLayout {
++                    columns: 6
++                    Label { text: qsTr("Width") }
++                    SpinBox { from: 640; to: 7680; editable: true; stepSize: 2; value: mon.width; onValueModified: cur().monitors[mi].width = value }
++                    Label { text: qsTr("Height") }
++                    SpinBox { from: 360; to: 4320; editable: true; stepSize: 2; value: mon.height; onValueModified: cur().monitors[mi].height = value }
++                    Label { text: qsTr("FPS") }
++                    SpinBox { from: 10; to: 480; editable: true; value: mon.fps; onValueModified: cur().monitors[mi].fps = value }
++                    Label { text: qsTr("Host port") }
++                    SpinBox { from: 1024; to: 65000; editable: true; value: mon.port || (47989 + 100 * index)
++                        textFromValue: function(v) { return "" + v }; onValueModified: cur().monitors[mi].port = value }
++                    Label { text: qsTr("Client screen #") }
++                    SpinBox { from: 0; to: 8; value: mon.clientDisplay !== undefined ? mon.clientDisplay : index
++                        onValueModified: cur().monitors[mi].clientDisplay = value }
++                }
++            }
++        }
++
++        // ---------------- Network rules ----------------
++        Label { text: qsTr("Network rules"); font.pointSize: 14; font.bold: true; Layout.topMargin: 20 }
++        Label {
++            Layout.fillWidth: true; wrapMode: Text.Wrap; font.pointSize: 10
++            text: qsTr("Checked top to bottom when you connect; the first match wins. A rule can switch to another profile and/or cap bitrate, FPS and height. SSIDs accept wildcards (iPhone*). 'tethered' = metered, cellular or Bluetooth link, or a listed hotspot SSID. 0 / empty = no change.")
++        }
++        RowLayout {
++            Label { text: netText; font.italic: true }
++            Button { text: qsTr("Refresh"); onClicked: netText = RdProfiles.describeNetwork() }
++        }
++
++        Repeater {
++            model: rules
++            delegate: GroupBox {
++                Layout.fillWidth: true
++                property var rule: modelData
++                property int ri: index
++                title: (ri + 1) + ". " + rule.name
++                GridLayout {
++                    columns: 4
++                    Label { text: qsTr("Name") }
++                    TextField { text: rule.name; onEditingFinished: { rules[ri].name = text; refreshRules() } }
++                    Label { text: qsTr("Connection") }
++                    ComboBox { model: matches; currentIndex: Math.max(0, matches.indexOf(rule.match)); onActivated: rules[ri].match = matches[index] }
++
++                    Label { text: qsTr("SSIDs (comma separated)") }
++                    TextField { Layout.preferredWidth: 220; text: (rule.ssids || []).join(", ")
++                        onEditingFinished: rules[ri].ssids = text.split(",").map(function(s) { return s.trim() }).filter(function(s) { return s.length > 0 }) }
++                    Label { text: qsTr("Use profile") }
++                    ComboBox { model: [qsTr("(keep)")].concat(page.names())
++                        currentIndex: rule.profile ? Math.max(0, page.names().indexOf(rule.profile) + 1) : 0
++                        onActivated: rules[ri].profile = index === 0 ? "" : page.names()[index - 1] }
++
++                    Label { text: qsTr("Bitrate (Mbps)") }
++                    SpinBox { from: 0; to: 500; editable: true; value: Math.round((rule.bitrateKbps || 0) / 1000); onValueModified: rules[ri].bitrateKbps = value * 1000 }
++                    Label { text: qsTr("Max FPS") }
++                    SpinBox { from: 0; to: 480; editable: true; value: rule.maxFps || 0; onValueModified: rules[ri].maxFps = value }
++
++                    Label { text: qsTr("Max height") }
++                    SpinBox { from: 0; to: 4320; editable: true; value: rule.maxHeight || 0; onValueModified: rules[ri].maxHeight = value }
++                    Label { text: qsTr("Codec") }
++                    ComboBox { model: [""].concat(codecs); currentIndex: Math.max(0, [""].concat(codecs).indexOf(rule.codec || "")); onActivated: rules[ri].codec = [""].concat(codecs)[index] }
++
++                    RowLayout {
++                        Layout.columnSpan: 4
++                        Button { text: "▲"; enabled: ri > 0; onClicked: { var r = rules.splice(ri, 1)[0]; rules.splice(ri - 1, 0, r); refreshRules() } }
++                        Button { text: "▼"; enabled: ri < rules.length - 1; onClicked: { var r = rules.splice(ri, 1)[0]; rules.splice(ri + 1, 0, r); refreshRules() } }
++                        Button { text: qsTr("Delete"); onClicked: { rules.splice(ri, 1); refreshRules() } }
++                    }
++                }
++            }
++        }
++
++        RowLayout {
++            Button { text: qsTr("Add rule"); onClicked: { rules.push(RdProfiles.newRule(qsTr("Rule %1").arg(rules.length + 1))); refreshRules() } }
++        }
++
++        RowLayout {
++            Layout.topMargin: 20
++            Button { text: qsTr("Save"); highlighted: true; onClicked: saveAll() }
++            Button { text: qsTr("Discard changes"); onClicked: reload() }
++        }
++    }
++}
+diff --git a/app/gui/main.qml b/app/gui/main.qml
+index 606fda8..3a5e72a 100644
+--- a/app/gui/main.qml
++++ b/app/gui/main.qml
+@@ -9,6 +9,7 @@ import AutoUpdateChecker 1.0
+ import StreamingPreferences 1.0
+ import SystemProperties 1.0
+ import SdlGamepadKeyNavigation 1.0
++import RdProfiles 1.0
+ 
+ ApplicationWindow {
+     property bool pollingActive: false
+@@ -429,6 +430,29 @@ ApplicationWindow {
+                 }
+             }
+ 
++            // RD: profile chooser for the next connection (empty = this device's default)
++            ComboBox {
++                id: rdProfileChooser
++                visible: stackView.currentItem instanceof PcView || stackView.currentItem instanceof AppView
++                Layout.preferredWidth: 220
++                model: [qsTr("Profile: %1 (default)").arg(RdProfiles.defaultProfile)].concat(RdProfiles.profileNames)
++                currentIndex: RdProfiles.sessionProfile === "" ? 0 : RdProfiles.profileNames.indexOf(RdProfiles.sessionProfile) + 1
++                onActivated: RdProfiles.sessionProfile = index === 0 ? "" : RdProfiles.profileNames[index - 1]
++                ToolTip.delay: 1000
++                ToolTip.visible: hovered
++                ToolTip.text: qsTr("Connection profile for the next stream")
++            }
++
++            NavigableToolButton {
++                id: rdProfilesButton
++                iconSource: "qrc:/res/settings.svg"
++                visible: stackView.currentItem instanceof SettingsView
++                onClicked: stackView.push("qrc:/gui/RdProfilesView.qml")
++                ToolTip.delay: 1000
++                ToolTip.visible: hovered
++                ToolTip.text: qsTr("Profiles & network rules")
++            }
++
+             NavigableToolButton {
+                 id: settingsButton
+ 
+diff --git a/app/main.cpp b/app/main.cpp
+index ac874e8..e6be1b7 100644
+--- a/app/main.cpp
++++ b/app/main.cpp
+@@ -52,6 +52,7 @@
+ #include "backend/computermanager.h"
+ #include "backend/systemproperties.h"
+ #include "streaming/session.h"
++#include "rd/rdprofiles.h"
+ #include "settings/streamingpreferences.h"
+ #include "gui/sdlgamepadkeynavigation.h"
+ 
+@@ -963,6 +964,12 @@ int main(int argc, char *argv[])
+                                                       [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
+                                                           return new SdlGamepadKeyNavigation(StreamingPreferences::get(qmlEngine));
+                                                       });
++    qmlRegisterSingletonType<RdProfiles>("RdProfiles", 1, 0, "RdProfiles",
++                                         [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
++                                             QObject* obj = RdProfiles::get();
++                                             qmlEngine->setObjectOwnership(obj, QQmlEngine::CppOwnership);
++                                             return obj;
++                                         });
+     qmlRegisterSingletonType<StreamingPreferences>("StreamingPreferences", 1, 0,
+                                                    "StreamingPreferences",
+                                                    [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
+diff --git a/app/qml.qrc b/app/qml.qrc
+index 5c2c369..6c0a13c 100644
+--- a/app/qml.qrc
++++ b/app/qml.qrc
+@@ -4,6 +4,7 @@
+         <file>gui/PcView.qml</file>
+         <file>gui/AppView.qml</file>
+         <file>gui/SettingsView.qml</file>
++        <file>gui/RdProfilesView.qml</file>
+         <file>gui/StreamSegue.qml</file>
+         <file>gui/GamepadMapper.qml</file>
+         <file>gui/QuitSegue.qml</file>
+diff --git a/app/rd/rdprofiles.cpp b/app/rd/rdprofiles.cpp
+new file mode 100644
+index 0000000..54cd213
+--- /dev/null
++++ b/app/rd/rdprofiles.cpp
+@@ -0,0 +1,394 @@
++// RD extension: per-device connection profiles, network rules, multi-monitor launch.
++#include "rdprofiles.h"
++
++#include "settings/streamingpreferences.h"
++#include "backend/nvcomputer.h"
++
++#include <QCoreApplication>
++#include <QJsonDocument>
++#include <QRegularExpression>
++#include <QSettings>
++#include <QSysInfo>
++
++#if QT_VERSION >= QT_VERSION_CHECK(6, 3, 0)
++#include <QNetworkInformation>
++#endif
++
++#define RD_SETTINGS_KEY "rd/config"
++#define RD_BASE_PORT 47989
++#define RD_PORT_STEP 100
++
++QString RdProfiles::s_CliProfile;
++int RdProfiles::s_CliMonitor = -1;
++
++RdProfiles* RdProfiles::get()
++{
++    static RdProfiles* s_Instance = new RdProfiles(QCoreApplication::instance());
++    return s_Instance;
++}
++
++RdProfiles::RdProfiles(QObject* parent) : QObject(parent)
++{
++    load();
++}
++
++void RdProfiles::load()
++{
++    QSettings settings;
++    QVariantMap root = QJsonDocument::fromJson(settings.value(RD_SETTINGS_KEY).toByteArray()).toVariant().toMap();
++    m_Profiles = root.value("profiles").toList();
++    m_Rules = root.value("rules").toList();
++    m_DefaultProfile = root.value("defaultProfile").toString();
++
++    if (m_Profiles.isEmpty()) {
++        // First run: one profile matching a single native-resolution monitor.
++        m_Profiles.append(newProfile(QSysInfo::machineHostName().isEmpty() ? "Default" : QSysInfo::machineHostName()));
++        m_DefaultProfile = m_Profiles.first().toMap().value("name").toString();
++    }
++}
++
++void RdProfiles::save()
++{
++    QVariantMap root;
++    root["profiles"] = m_Profiles;
++    root["rules"] = m_Rules;
++    root["defaultProfile"] = m_DefaultProfile;
++    QSettings settings;
++    settings.setValue(RD_SETTINGS_KEY, QJsonDocument::fromVariant(root).toJson(QJsonDocument::Compact));
++}
++
++void RdProfiles::setProfiles(const QVariantList& p) { m_Profiles = p; emit changed(); }
++void RdProfiles::setRules(const QVariantList& r) { m_Rules = r; emit changed(); }
++void RdProfiles::setDefaultProfile(const QString& n) { m_DefaultProfile = n; emit changed(); }
++void RdProfiles::setSessionProfile(const QString& n) { m_SessionProfile = n; emit changed(); }
++
++QStringList RdProfiles::profileNames() const
++{
++    QStringList names;
++    for (const QVariant& v : m_Profiles) {
++        names.append(v.toMap().value("name").toString());
++    }
++    return names;
++}
++
++QVariantMap RdProfiles::newProfile(const QString& name) const
++{
++    QVariantMap monitor;
++    monitor["width"] = 1920;
++    monitor["height"] = 1080;
++    monitor["fps"] = 60;
++    monitor["port"] = RD_BASE_PORT;
++    monitor["clientDisplay"] = 0;
++
++    QVariantMap p;
++    p["name"] = name;
++    p["bitrateKbps"] = 0;           // 0 = Moonlight default for the resolution/fps
++    p["codec"] = "auto";
++    p["hdr"] = false;
++    p["localCursor"] = true;
++    p["windowMode"] = "fullscreen";
++    p["monitors"] = QVariantList { monitor };
++    return p;
++}
++
++QVariantMap RdProfiles::newRule(const QString& name) const
++{
++    QVariantMap r;
++    r["name"] = name;
++    r["match"] = "wifi";
++    r["ssids"] = QStringList();
++    r["profile"] = "";
++    r["bitrateKbps"] = 0;
++    r["maxFps"] = 0;
++    r["maxHeight"] = 0;
++    r["codec"] = "";
++    return r;
++}
++
++QVariantMap RdProfiles::findProfile(const QString& name) const
++{
++    for (const QVariant& v : m_Profiles) {
++        if (v.toMap().value("name").toString() == name) {
++            return v.toMap();
++        }
++    }
++    return m_Profiles.isEmpty() ? QVariantMap() : m_Profiles.first().toMap();
++}
++
++void RdProfiles::setCliSelection(const QString& profile, int monitorIndex)
++{
++    s_CliProfile = profile;
++    s_CliMonitor = monitorIndex;
++}
++
++int RdProfiles::cliMonitorIndex()
++{
++    return s_CliMonitor;
++}
++
++static QString runAndRead(const QString& program, const QStringList& args)
++{
++    QProcess p;
++    p.start(program, args);
++    if (!p.waitForFinished(1500)) {
++        p.kill();
++        return QString();
++    }
++    return QString::fromLocal8Bit(p.readAllStandardOutput());
++}
++
++static QString detectSsid()
++{
++#if defined(Q_OS_WIN)
++    // Windows 11 24H2+: needs Location services on for the SSID to be visible.
++    QString out = runAndRead("netsh", { "wlan", "show", "interfaces" });
++    static QRegularExpression re("^\\s*SSID\\s*:\\s*(.+?)\\s*$", QRegularExpression::MultilineOption);
++    auto m = re.match(out);
++    return m.hasMatch() ? m.captured(1) : QString();
++#elif defined(Q_OS_MACOS)
++    // macOS 14+ redacts the SSID unless the app has Location permission.
++    QString out = runAndRead("/usr/sbin/ipconfig", { "getsummary", "en0" });
++    static QRegularExpression re("^\\s*SSID\\s*:\\s*(.+?)\\s*$", QRegularExpression::MultilineOption);
++    auto m = re.match(out);
++    QString ssid = m.hasMatch() ? m.captured(1) : QString();
++    return ssid == "<redacted>" ? QString() : ssid;
++#elif defined(Q_OS_LINUX)
++    QString out = runAndRead("nmcli", { "-t", "-f", "active,ssid", "dev", "wifi" });
++    for (const QString& line : out.split('\n')) {
++        if (line.startsWith("yes:")) {
++            return line.mid(4).replace("\\:", ":");
++        }
++    }
++    return QString();
++#else
++    return QString();
++#endif
++}
++
++RdNetworkInfo RdProfiles::detectNetwork()
++{
++    RdNetworkInfo info;
++    info.medium = "unknown";
++
++#if QT_VERSION >= QT_VERSION_CHECK(6, 3, 0)
++    if (!QNetworkInformation::instance()) {
++        QNetworkInformation::loadBackendByFeatures(QNetworkInformation::Feature::TransportMedium |
++                                                   QNetworkInformation::Feature::Metered);
++    }
++    if (auto ni = QNetworkInformation::instance()) {
++        switch (ni->transportMedium()) {
++        case QNetworkInformation::TransportMedium::Ethernet: info.medium = "ethernet"; break;
++        case QNetworkInformation::TransportMedium::WiFi: info.medium = "wifi"; break;
++        case QNetworkInformation::TransportMedium::Cellular: info.medium = "cellular"; break;
++        case QNetworkInformation::TransportMedium::Bluetooth: info.medium = "bluetooth"; break;
++        default: break;
++        }
++        if (ni->supports(QNetworkInformation::Feature::Metered)) {
++            info.metered = ni->isMetered();
++        }
++    }
++#endif
++
++    info.ssid = detectSsid();
++    if (info.medium == "unknown" && !info.ssid.isEmpty()) {
++        info.medium = "wifi";
++    }
++    return info;
++}
++
++static bool ssidMatches(const QString& ssid, const QStringList& patterns)
++{
++    for (const QString& pat : patterns) {
++        if (pat.trimmed().isEmpty()) {
++            continue;
++        }
++        QRegularExpression re(QRegularExpression::wildcardToRegularExpression(pat.trimmed()),
++                              QRegularExpression::CaseInsensitiveOption);
++        if (re.match(ssid).hasMatch()) {
++            return true;
++        }
++    }
++    return false;
++}
++
++QVariantMap RdProfiles::matchRule(const RdNetworkInfo& net) const
++{
++    for (const QVariant& v : m_Rules) {
++        QVariantMap r = v.toMap();
++        QString match = r.value("match").toString();
++        QStringList ssids = r.value("ssids").toStringList();
++        ssids.removeAll(QString());
++
++        bool typeOk;
++        if (match == "any") {
++            typeOk = true;
++        }
++        else if (match == "tethered") {
++            // Hotspot / USB / Bluetooth tethering: OS-reported metered, cellular or Bluetooth link,
++            // or a Wi-Fi SSID from this rule's list.
++            typeOk = net.metered || net.medium == "cellular" || net.medium == "bluetooth" ||
++                     (!ssids.isEmpty() && ssidMatches(net.ssid, ssids));
++        }
++        else {
++            typeOk = (match == net.medium);
++        }
++        if (!typeOk) {
++            continue;
++        }
++        if (match != "tethered" && !ssids.isEmpty() && !ssidMatches(net.ssid, ssids)) {
++            continue;
++        }
++        return r;
++    }
++    return QVariantMap();
++}
++
++QString RdProfiles::describeNetwork()
++{
++    RdNetworkInfo net = detectNetwork();
++    QVariantMap rule = matchRule(net);
++    QString s = tr("Network: %1").arg(net.medium);
++    if (!net.ssid.isEmpty()) s += QString(" \"%1\"").arg(net.ssid);
++    if (net.metered) s += tr(" (metered)");
++    s += tr(" — rule: %1").arg(rule.isEmpty() ? tr("none") : rule.value("name").toString());
++    return s;
++}
++
++static StreamingPreferences::VideoCodecConfig codecFromString(const QString& c, StreamingPreferences::VideoCodecConfig fallback)
++{
++    if (c == "auto") return StreamingPreferences::VCC_AUTO;
++    if (c == "h264") return StreamingPreferences::VCC_FORCE_H264;
++    if (c == "hevc") return StreamingPreferences::VCC_FORCE_HEVC;
++    if (c == "av1") return StreamingPreferences::VCC_FORCE_AV1;
++    return fallback;
++}
++
++StreamingPreferences* RdProfiles::prepare(StreamingPreferences* cliPrefs, QObject* parent)
++{
++    int monitorIndex = 0;
++    QString profileName;
++
++    if (cliPrefs) {
++        if (s_CliMonitor < 0) {
++            // Plain CLI stream: leave the user's command-line settings alone.
++            m_ActiveProfile.clear();
++            m_ActiveLocalCursor = true;
++            m_ActiveClientDisplay = -1;
++            return cliPrefs;
++        }
++        monitorIndex = s_CliMonitor;
++        profileName = s_CliProfile;
++    }
++    else {
++        profileName = m_SessionProfile.isEmpty() ? m_DefaultProfile : m_SessionProfile;
++        // The chooser applies to one connection only.
++        m_SessionProfile.clear();
++        emit changed();
++    }
++
++    // Network rule can switch to another profile and cap values.
++    RdNetworkInfo net = detectNetwork();
++    QVariantMap rule = matchRule(net);
++    if (!rule.value("profile").toString().isEmpty() && s_CliMonitor < 0) {
++        profileName = rule.value("profile").toString();
++    }
++
++    m_ActiveProfile = findProfile(profileName);
++
++    StreamingPreferences* prefs = cliPrefs ? cliPrefs : StreamingPreferences::createDetached(parent);
++    if (m_ActiveProfile.isEmpty()) {
++        return prefs;
++    }
++
++    QVariantList monitors = m_ActiveProfile.value("monitors").toList();
++    QVariantMap mon = monitorIndex < monitors.size() ? monitors.at(monitorIndex).toMap() : QVariantMap();
++
++    if (mon.value("width").toInt() > 0 && mon.value("height").toInt() > 0) {
++        prefs->width = mon.value("width").toInt();
++        prefs->height = mon.value("height").toInt();
++    }
++    if (mon.value("fps").toInt() > 0) {
++        prefs->fps = mon.value("fps").toInt();
++    }
++    prefs->bitrateKbps = m_ActiveProfile.value("bitrateKbps").toInt() > 0
++            ? m_ActiveProfile.value("bitrateKbps").toInt()
++            : StreamingPreferences::getDefaultBitrate(prefs->width, prefs->height, prefs->fps, prefs->enableYUV444);
++    prefs->videoCodecConfig = codecFromString(m_ActiveProfile.value("codec").toString(), prefs->videoCodecConfig);
++    prefs->enableHdr = m_ActiveProfile.value("hdr").toBool();
++
++    QString wm = m_ActiveProfile.value("windowMode").toString();
++    if (wm == "fullscreen") prefs->windowMode = StreamingPreferences::WM_FULLSCREEN;
++    else if (wm == "borderless") prefs->windowMode = StreamingPreferences::WM_FULLSCREEN_DESKTOP;
++    else if (wm == "windowed") prefs->windowMode = StreamingPreferences::WM_WINDOWED;
++
++    m_ActiveLocalCursor = m_ActiveProfile.value("localCursor", true).toBool();
++    if (m_ActiveLocalCursor) {
++        // Client-drawn cursor needs absolute (desktop) mouse mode.
++        prefs->absoluteMouseMode = true;
++    }
++    m_ActiveClientDisplay = mon.contains("clientDisplay") ? mon.value("clientDisplay").toInt() : monitorIndex;
++
++    // Network rule caps
++    if (!rule.isEmpty()) {
++        int maxH = rule.value("maxHeight").toInt();
++        if (maxH > 0 && prefs->height > maxH) {
++            prefs->width = ((prefs->width * maxH / prefs->height) + 1) & ~1;
++            prefs->height = maxH;
++        }
++        int maxFps = rule.value("maxFps").toInt();
++        if (maxFps > 0 && prefs->fps > maxFps) {
++            prefs->fps = maxFps;
++        }
++        int br = rule.value("bitrateKbps").toInt();
++        if (br > 0) {
++            // Split the rule's bitrate across monitors
++            prefs->bitrateKbps = qMax(1000, br / qMax(1, (int)monitors.size()));
++        }
++        prefs->videoCodecConfig = codecFromString(rule.value("codec").toString(), prefs->videoCodecConfig);
++    }
++
++    return prefs;
++}
++
++void RdProfiles::launchSecondaryMonitors(NvComputer* computer, const QString& appName)
++{
++    stopSecondaryMonitors();
++    if (s_CliMonitor > 0 || m_ActiveProfile.isEmpty() || computer == nullptr) {
++        // Secondary processes never spawn more processes.
++        return;
++    }
++
++    QVariantList monitors = m_ActiveProfile.value("monitors").toList();
++    QString host = computer->activeAddress.address();
++    if (host.isEmpty()) {
++        host = computer->name;
++    }
++
++    for (int i = 1; i < monitors.size(); i++) {
++        QVariantMap mon = monitors.at(i).toMap();
++        int port = mon.value("port").toInt() > 0 ? mon.value("port").toInt() : RD_BASE_PORT + RD_PORT_STEP * i;
++        QString target = host.contains(':') ? QString("[%1]:%2").arg(host).arg(port) : QString("%1:%2").arg(host).arg(port);
++
++        auto proc = new QProcess(this);
++        proc->setProgram(QCoreApplication::applicationFilePath());
++        proc->setArguments({ "stream", target, appName,
++                             "--rd-profile", m_ActiveProfile.value("name").toString(),
++                             "--rd-monitor", QString::number(i) });
++        connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), proc, &QObject::deleteLater);
++        proc->start();
++        m_Secondaries.append(proc);
++    }
++}
++
++void RdProfiles::stopSecondaryMonitors()
++{
++    for (auto& p : m_Secondaries) {
++        if (p && p->state() != QProcess::NotRunning) {
++            p->terminate();
++            if (!p->waitForFinished(3000)) {
++                p->kill();
++            }
++        }
++    }
++    m_Secondaries.clear();
++}
+diff --git a/app/rd/rdprofiles.h b/app/rd/rdprofiles.h
+new file mode 100644
+index 0000000..2425693
+--- /dev/null
++++ b/app/rd/rdprofiles.h
+@@ -0,0 +1,100 @@
++// RD extension: per-device connection profiles, network rules, multi-monitor launch.
++#pragma once
++
++#include <QObject>
++#include <QVariantList>
++#include <QProcess>
++#include <QList>
++#include <QPointer>
++
++class StreamingPreferences;
++class NvComputer;
++
++struct RdNetworkInfo {
++    QString medium;   // "ethernet", "wifi", "cellular", "bluetooth", "unknown"
++    bool metered = false;
++    QString ssid;     // empty if unknown / not Wi-Fi
++};
++
++/*
++ * Stored in QSettings key "rd/config" as JSON:
++ * {
++ *   "defaultProfile": "Desktop",
++ *   "profiles": [ { "name": "Desktop", "bitrateKbps": 50000, "codec": "auto|h264|hevc|av1",
++ *                   "hdr": false, "localCursor": true, "windowMode": "fullscreen|borderless|windowed",
++ *                   "monitors": [ { "width": 2560, "height": 1440, "fps": 144, "port": 47989, "clientDisplay": 0 },
++ *                                 { "width": 1920, "height": 1080, "fps": 60,  "port": 48089, "clientDisplay": 1 } ] } ],
++ *   "rules": [ { "name": "Phone hotspot", "match": "any|ethernet|wifi|cellular|tethered",
++ *                "ssids": ["iPhone*", "Pixel*"], "profile": "", "bitrateKbps": 10000, "maxFps": 60,
++ *                "maxHeight": 1080, "codec": "hevc" } ]
++ * }
++ * Rules are checked top to bottom; the first match wins.
++ */
++class RdProfiles : public QObject
++{
++    Q_OBJECT
++    Q_PROPERTY(QVariantList profiles READ profiles WRITE setProfiles NOTIFY changed)
++    Q_PROPERTY(QVariantList rules READ rules WRITE setRules NOTIFY changed)
++    Q_PROPERTY(QString defaultProfile READ defaultProfile WRITE setDefaultProfile NOTIFY changed)
++    Q_PROPERTY(QString sessionProfile READ sessionProfile WRITE setSessionProfile NOTIFY changed)
++    Q_PROPERTY(QStringList profileNames READ profileNames NOTIFY changed)
++
++public:
++    static RdProfiles* get();
++
++    QVariantList profiles() const { return m_Profiles; }
++    void setProfiles(const QVariantList& p);
++    QVariantList rules() const { return m_Rules; }
++    void setRules(const QVariantList& r);
++    QString defaultProfile() const { return m_DefaultProfile; }
++    void setDefaultProfile(const QString& n);
++    QString sessionProfile() const { return m_SessionProfile; }
++    void setSessionProfile(const QString& n);
++    QStringList profileNames() const;
++
++    Q_INVOKABLE void save();
++    Q_INVOKABLE QVariantMap newProfile(const QString& name) const;
++    Q_INVOKABLE QVariantMap newRule(const QString& name) const;
++    // Human-readable description of the current network and the rule that matches it.
++    Q_INVOKABLE QString describeNetwork();
++
++    // CLI (secondary monitor processes): --rd-profile NAME --rd-monitor N
++    static void setCliSelection(const QString& profile, int monitorIndex);
++    static int cliMonitorIndex();
++
++    // Returns preferences for a new session. GUI sessions (cliPrefs == nullptr) get a
++    // detached copy of the saved settings with the profile + network rule applied.
++    StreamingPreferences* prepare(StreamingPreferences* cliPrefs, QObject* parent);
++
++    // Effective (resolved) values for the session that prepare() last configured.
++    bool localCursorEnabled() const { return m_ActiveLocalCursor; }
++    int clientDisplayIndex() const { return m_ActiveClientDisplay; }
++
++    // Starts one extra Moonlight process per extra monitor of the active profile.
++    void launchSecondaryMonitors(NvComputer* computer, const QString& appName);
++    void stopSecondaryMonitors();
++
++    static RdNetworkInfo detectNetwork();
++
++signals:
++    void changed();
++
++private:
++    explicit RdProfiles(QObject* parent = nullptr);
++    void load();
++    QVariantMap findProfile(const QString& name) const;
++    QVariantMap matchRule(const RdNetworkInfo& net) const;
++
++    QVariantList m_Profiles;
++    QVariantList m_Rules;
++    QString m_DefaultProfile;
++    QString m_SessionProfile;
++
++    QVariantMap m_ActiveProfile;
++    bool m_ActiveLocalCursor = true;
++    int m_ActiveClientDisplay = -1;
++    QList<QPointer<QProcess>> m_Secondaries;
++
++    static QString s_CliProfile;
++    static int s_CliMonitor;
++};
+diff --git a/app/settings/streamingpreferences.cpp b/app/settings/streamingpreferences.cpp
+index 6d143af..416b80a 100644
+--- a/app/settings/streamingpreferences.cpp
++++ b/app/settings/streamingpreferences.cpp
+@@ -65,6 +65,13 @@ StreamingPreferences::StreamingPreferences(QQmlEngine *qmlEngine)
+     reload();
+ }
+ 
++StreamingPreferences* StreamingPreferences::createDetached(QObject* parent)
++{
++    auto prefs = new StreamingPreferences(nullptr);
++    prefs->setParent(parent);
++    return prefs;
++}
++
+ StreamingPreferences* StreamingPreferences::get(QQmlEngine *qmlEngine)
+ {
+     {
+diff --git a/app/settings/streamingpreferences.h b/app/settings/streamingpreferences.h
+index ad611f6..a5c1eaf 100644
+--- a/app/settings/streamingpreferences.h
++++ b/app/settings/streamingpreferences.h
+@@ -11,6 +11,9 @@ class StreamingPreferences : public QObject
+ public:
+     static StreamingPreferences* get(QQmlEngine *qmlEngine = nullptr);
+ 
++    // RD: a private copy of the saved settings that can be changed for one session without saving.
++    static StreamingPreferences* createDetached(QObject* parent);
++
+     Q_INVOKABLE static int
+     getDefaultBitrate(int width, int height, int fps, bool yuv444);
+ 
+diff --git a/app/streaming/input/input.cpp b/app/streaming/input/input.cpp
+index 2597f99..de4a3ac 100644
+--- a/app/streaming/input/input.cpp
++++ b/app/streaming/input/input.cpp
+@@ -218,6 +218,12 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
+ 
+ SdlInputHandler::~SdlInputHandler()
+ {
++    if (m_RdCursor != nullptr) {
++        SDL_SetCursor(SDL_GetDefaultCursor());
++        SDL_FreeCursor(m_RdCursor);
++        m_RdCursor = nullptr;
++    }
++
+     for (int i = 0; i < MAX_GAMEPADS; i++) {
+         if (m_GamepadState[i].mouseEmulationTimer != 0) {
+             Session::get()->notifyMouseEmulationMode(false);
+diff --git a/app/streaming/input/input.h b/app/streaming/input/input.h
+index 8113316..b0e2315 100644
+--- a/app/streaming/input/input.h
++++ b/app/streaming/input/input.h
+@@ -5,6 +5,8 @@
+ 
+ #include "SDL_compat.h"
+ 
++#include <QHash>
++
+ struct GamepadState {
+     SDL_GameController* controller;
+     SDL_JoystickID jsId;
+@@ -86,6 +88,11 @@ class SdlInputHandler
+ public:
+     explicit SdlInputHandler(StreamingPreferences& prefs, int streamWidth, int streamHeight);
+ 
++    // RD extension: client-drawn cursor
++    void rdEnableLocalCursor();
++    void rdSetCursorShape(uint32_t id, int width, int height, int hotX, int hotY, const QByteArray& bgra);
++    void rdSetCursorState(uint32_t id, bool visible);
++
+     ~SdlInputHandler();
+ 
+     void setWindow(SDL_Window* window);
+@@ -227,6 +234,20 @@ private:
+     StreamingPreferences::CaptureSysKeysMode m_CaptureSystemKeysMode;
+     int m_MouseCursorCapturedVisibilityState;
+ 
++    // RD extension: client-drawn cursor
++    struct RdCursorShape { int width, height, hotX, hotY; QByteArray bgra; };
++    void rdApplyCursor();
++    void rdUpdateMode();
++    float rdCursorScale();
++    QHash<uint32_t, RdCursorShape> m_RdShapes;
++    bool m_RdLocalCursor = false;
++    bool m_RdHostVisible = true;
++    Uint32 m_RdHiddenSince = 0;
++    uint32_t m_RdCurrentId = 0;
++    uint32_t m_RdAppliedId = 0;
++    float m_RdAppliedScale = 0;
++    SDL_Cursor* m_RdCursor = nullptr;
++
+     struct {
+         KeyCombo keyCombo;
+         SDL_Keycode keyCode;
+diff --git a/app/streaming/input/mouse.cpp b/app/streaming/input/mouse.cpp
+index c5bd1fd..b1c4faf 100644
+--- a/app/streaming/input/mouse.cpp
++++ b/app/streaming/input/mouse.cpp
+@@ -92,6 +92,10 @@ void SdlInputHandler::handleMouseButtonEvent(SDL_MouseButtonEvent* event)
+ 
+ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
+ {
++    if (m_RdLocalCursor) {
++        rdUpdateMode();
++    }
++
+     if (!isCaptureActive()) {
+         // Not capturing
+         return;
+diff --git a/app/streaming/input/rdcursor.cpp b/app/streaming/input/rdcursor.cpp
+new file mode 100644
+index 0000000..a3657fe
+--- /dev/null
++++ b/app/streaming/input/rdcursor.cpp
+@@ -0,0 +1,162 @@
++// RD extension: client-drawn cursor (Parsec-style).
++// The host stops drawing the cursor into the video and sends its shape instead.
++// We show it as the OS cursor, so it moves at local refresh rate with zero network delay.
++#include "input.h"
++#include "streaming/streamutils.h"
++
++#include <cmath>
++
++// Host cursor hidden this long (ms) = an app captured the mouse (e.g. a game):
++// switch to relative mode. Shorter gaps (hide-while-typing) keep absolute mode.
++#define RD_HIDDEN_TO_RELATIVE_MS 400
++
++void SdlInputHandler::rdEnableLocalCursor()
++{
++    m_RdLocalCursor = true;
++    m_AbsoluteMouseMode = true;
++    m_MouseCursorCapturedVisibilityState = SDL_ENABLE;
++    if (isCaptureActive()) {
++        SDL_ShowCursor(SDL_ENABLE);
++    }
++    rdApplyCursor();
++}
++
++float SdlInputHandler::rdCursorScale()
++{
++    if (m_Window == nullptr || m_StreamWidth <= 0 || m_StreamHeight <= 0) {
++        return 1.0f;
++    }
++
++    // Cursor pixels are host pixels. Scale them like the video, in window coordinates
++    // (points on macOS, so Retina displays get the right physical size).
++    int windowWidth, windowHeight;
++    SDL_GetWindowSize(m_Window, &windowWidth, &windowHeight);
++
++    SDL_Rect src = { 0, 0, m_StreamWidth, m_StreamHeight };
++    SDL_Rect dst = { 0, 0, windowWidth, windowHeight };
++    StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
++
++    float scale = (float)dst.w / (float)m_StreamWidth;
++    return scale > 0 ? scale : 1.0f;
++}
++
++void SdlInputHandler::rdApplyCursor()
++{
++    if (!m_RdLocalCursor || m_RdCurrentId == 0 || !m_RdShapes.contains(m_RdCurrentId)) {
++        return;
++    }
++
++    float scale = rdCursorScale();
++    if (m_RdCursor != nullptr && m_RdAppliedId == m_RdCurrentId && std::fabs(scale - m_RdAppliedScale) < 0.01f) {
++        return;
++    }
++
++    const RdCursorShape& shape = m_RdShapes[m_RdCurrentId];
++    SDL_Surface* src = SDL_CreateRGBSurfaceWithFormatFrom((void*)shape.bgra.constData(),
++                                                          shape.width, shape.height, 32, shape.width * 4,
++                                                          SDL_PIXELFORMAT_ARGB8888);
++    if (src == nullptr) {
++        return;
++    }
++
++    int w = qMax(1, (int)std::lround(shape.width * scale));
++    int h = qMax(1, (int)std::lround(shape.height * scale));
++    SDL_Surface* surface = src;
++    if (w != shape.width || h != shape.height) {
++        surface = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
++        if (surface != nullptr) {
++            SDL_SetSurfaceBlendMode(src, SDL_BLENDMODE_NONE);
++            SDL_Rect dstRect = { 0, 0, w, h };
++            SDL_BlitScaled(src, nullptr, surface, &dstRect);
++        }
++        else {
++            surface = src;
++            w = shape.width;
++            h = shape.height;
++        }
++    }
++
++    float sx = (float)w / shape.width;
++    float sy = (float)h / shape.height;
++    SDL_Cursor* cursor = SDL_CreateColorCursor(surface,
++                                               qBound(0, (int)(shape.hotX * sx), w - 1),
++                                               qBound(0, (int)(shape.hotY * sy), h - 1));
++    if (surface != src) {
++        SDL_FreeSurface(surface);
++    }
++    SDL_FreeSurface(src);
++
++    if (cursor != nullptr) {
++        SDL_SetCursor(cursor);
++        if (m_RdCursor != nullptr) {
++            SDL_FreeCursor(m_RdCursor);
++        }
++        m_RdCursor = cursor;
++        m_RdAppliedId = m_RdCurrentId;
++        m_RdAppliedScale = scale;
++    }
++}
++
++void SdlInputHandler::rdSetCursorShape(uint32_t id, int width, int height, int hotX, int hotY, const QByteArray& bgra)
++{
++    // Keep a small cache; hosts reuse a handful of shapes.
++    if (m_RdShapes.size() > 64) {
++        m_RdShapes.clear();
++    }
++    m_RdShapes.insert(id, RdCursorShape { width, height, hotX, hotY, bgra });
++    m_RdCurrentId = id;
++    rdApplyCursor();
++}
++
++void SdlInputHandler::rdSetCursorState(uint32_t id, bool visible)
++{
++    if (id != 0 && id != m_RdCurrentId) {
++        m_RdCurrentId = id;
++        rdApplyCursor();
++    }
++
++    if (visible == m_RdHostVisible) {
++        return;
++    }
++    m_RdHostVisible = visible;
++
++    if (!visible) {
++        // Hide right away; decide about relative mode on the next mouse motion.
++        m_RdHiddenSince = SDL_GetTicks();
++        m_MouseCursorCapturedVisibilityState = SDL_DISABLE;
++        if (isCaptureActive() && m_AbsoluteMouseMode) {
++            SDL_ShowCursor(SDL_DISABLE);
++        }
++    }
++    else {
++        m_RdHiddenSince = 0;
++        m_MouseCursorCapturedVisibilityState = SDL_ENABLE;
++        rdUpdateMode();
++        if (isCaptureActive()) {
++            SDL_ShowCursor(SDL_ENABLE);
++        }
++    }
++}
++
++void SdlInputHandler::rdUpdateMode()
++{
++    bool wantAbsolute = m_RdHostVisible ||
++            (m_RdHiddenSince != 0 && SDL_GetTicks() - m_RdHiddenSince < RD_HIDDEN_TO_RELATIVE_MS);
++
++    if (wantAbsolute != m_AbsoluteMouseMode) {
++        bool active = isCaptureActive();
++        if (active) {
++            setCaptureActive(false);
++        }
++        m_AbsoluteMouseMode = wantAbsolute;
++        if (active) {
++            // Re-capturing in absolute mode also syncs the host cursor to the local position.
++            setCaptureActive(true);
++        }
++    }
++
++    if (m_AbsoluteMouseMode) {
++        // Window may have been resized or moved to another display
++        rdApplyCursor();
++    }
++}
+diff --git a/app/streaming/session.cpp b/app/streaming/session.cpp
+index 75d30a1..e02e8f0 100644
+--- a/app/streaming/session.cpp
++++ b/app/streaming/session.cpp
+@@ -2,6 +2,7 @@
+ #include "settings/streamingpreferences.h"
+ #include "streaming/streamutils.h"
+ #include "backend/richpresencemanager.h"
++#include "rd/rdprofiles.h"
+ 
+ #include <Limelight.h>
+ #include "SDL_compat.h"
+@@ -28,6 +29,14 @@
+ #define SDL_CODE_GAMECONTROLLER_SET_MOTION_EVENT_STATE 103
+ #define SDL_CODE_GAMECONTROLLER_SET_CONTROLLER_LED 104
+ #define SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS 105
++#define SDL_CODE_RD_CURSOR_SHAPE 106
++#define SDL_CODE_RD_CURSOR_STATE 107
++
++struct RdCursorShapeEvent {
++    uint32_t id;
++    int width, height, hotX, hotY;
++    QByteArray bgra;
++};
+ 
+ #include <openssl/rand.h>
+ 
+@@ -40,6 +49,7 @@
+ #include <QGuiApplication>
+ #include <QCursor>
+ #include <QScreen>
++#include <QSysInfo>
+ 
+ #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+ #include <QQuickOpenGLUtils>
+@@ -60,7 +70,9 @@ CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
+     Session::clRumbleTriggers,
+     Session::clSetMotionEventState,
+     Session::clSetControllerLED,
+-    Session::clSetAdaptiveTriggers
++    Session::clSetAdaptiveTriggers,
++    Session::clRdSetCursorShape,
++    Session::clRdSetCursorState
+ };
+ 
+ Session* Session::s_ActiveSession;
+@@ -198,6 +210,60 @@ void Session::clConnectionStatusUpdate(int connectionStatus)
+     }
+ }
+ 
++void Session::clRdSetCursorShape(uint32_t id, uint16_t width, uint16_t height, uint16_t hotX, uint16_t hotY, const uint8_t* bgra)
++{
++    // Called on the control stream thread: copy and hand off to the main thread.
++    auto shape = new RdCursorShapeEvent { id, width, height, hotX, hotY,
++                                          QByteArray((const char*)bgra, (int)width * height * 4) };
++    SDL_Event event = {};
++    event.type = SDL_USEREVENT;
++    event.user.code = SDL_CODE_RD_CURSOR_SHAPE;
++    event.user.data1 = shape;
++    if (SDL_PushEvent(&event) <= 0) {
++        delete shape;
++    }
++}
++
++void Session::clRdSetCursorState(uint32_t id, bool visible)
++{
++    SDL_Event event = {};
++    event.type = SDL_USEREVENT;
++    event.user.code = SDL_CODE_RD_CURSOR_STATE;
++    event.user.data1 = (void*)(uintptr_t)id;
++    event.user.data2 = (void*)(uintptr_t)(visible ? 1 : 0);
++    SDL_PushEvent(&event);
++}
++
++Uint32 Session::rdBatteryTimerCallback(Uint32 interval, void*)
++{
++    // Runs on SDL's timer thread. Report client battery to the host tray.
++    static int lastPercent = -2;
++    static uint8_t lastFlags = 0xFF;
++    static Uint32 lastSent = 0;
++    static const QByteArray deviceName = QSysInfo::machineHostName().left(64).toUtf8();
++
++    int secs = -1, pct = -1;
++    SDL_PowerState state = SDL_GetPowerInfo(&secs, &pct);
++    uint8_t flags = 0;
++    switch (state) {
++    case SDL_POWERSTATE_ON_BATTERY: flags = RD_BATT_DISCHARGING; break;
++    case SDL_POWERSTATE_CHARGING: flags = RD_BATT_CHARGING; break;
++    case SDL_POWERSTATE_NO_BATTERY: flags = RD_BATT_NO_BATTERY; break;
++    default: break;
++    }
++
++    Uint32 now = SDL_GetTicks();
++    if (pct != lastPercent || flags != lastFlags || now - lastSent > 120000) {
++        uint16_t minutes = secs >= 0 ? (uint16_t)qMin(secs / 60, 0xFFFE) : 0xFFFF;
++        if (LiRdSendBatteryStatus(pct >= 0 ? (uint8_t)pct : 255, flags, minutes, deviceName.constData()) == 0) {
++            lastPercent = pct;
++            lastFlags = flags;
++            lastSent = now;
++        }
++    }
++    return interval;
++}
++
+ void Session::clSetHdrMode(bool enabled)
+ {
+     // If we're in the process of recreating our decoder when we get
+@@ -586,6 +652,9 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
+       m_AudioSampleCount(0),
+       m_DropAudioEndTime(0)
+ {
++    // RD: apply the connection profile + network rule (GUI sessions get a private copy of settings)
++    m_Preferences = RdProfiles::get()->prepare(preferences, this);
++    m_IsFullScreen = m_Preferences->windowMode != StreamingPreferences::WM_WINDOWED || !WMUtils::isRunningDesktopEnvironment();
+ }
+ 
+ Session::~Session()
+@@ -1413,6 +1482,12 @@ void Session::getWindowDimensions(int& x, int& y,
+     }
+ 
+     x = y = SDL_WINDOWPOS_CENTERED_DISPLAY(displayIndex);
++
++    // RD: multi-monitor profiles put each stream on its own client display
++    int rdDisplay = RdProfiles::get()->clientDisplayIndex();
++    if (rdDisplay >= 0 && rdDisplay < SDL_GetNumVideoDisplays()) {
++        x = y = SDL_WINDOWPOS_CENTERED_DISPLAY(rdDisplay);
++    }
+ }
+ 
+ void Session::updateOptimalWindowDisplayMode()
+@@ -1720,6 +1795,9 @@ bool Session::startConnectionAsync()
+                                                                          false);
+     }
+ 
++    // RD: ask the host for client-drawn cursor shapes
++    LiRdSetLocalCursorRequested(RdProfiles::get()->localCursorEnabled());
++
+     int err = LiStartConnection(&hostInfo, &m_StreamConfig, &k_ConnCallbacks,
+                                 &m_VideoCallbacks, &m_AudioCallbacks,
+                                 NULL, 0, NULL, 0);
+@@ -1895,6 +1973,16 @@ void Session::exec()
+ 
+     m_InputHandler->setWindow(m_Window);
+ 
++    // RD: client-drawn cursor, battery reporting, extra monitors
++    if (LiRdIsLocalCursorActive()) {
++        m_InputHandler->rdEnableLocalCursor();
++    }
++    if (LiGetHostFeatureFlags() & LI_FF_RD_LOCAL_CURSOR) {
++        rdBatteryTimerCallback(0, nullptr);
++        m_RdBatteryTimer = SDL_AddTimer(30000, rdBatteryTimerCallback, nullptr);
++    }
++    RdProfiles::get()->launchSecondaryMonitors(m_Computer, m_App.name);
++
+     QSvgRenderer svgIconRenderer(QString(":/res/moonlight.svg"));
+     QImage svgImage(ICON_SIZE, ICON_SIZE, QImage::Format_RGBA8888);
+     svgImage.fill(0);
+@@ -2053,6 +2141,17 @@ void Session::exec()
+                 m_InputHandler->setAdaptiveTriggers((uint16_t)(uintptr_t)event.user.data1,
+                                                     (DualSenseOutputReport *)event.user.data2);
+                 break;
++            case SDL_CODE_RD_CURSOR_SHAPE: {
++                auto shape = (RdCursorShapeEvent*)event.user.data1;
++                m_InputHandler->rdSetCursorShape(shape->id, shape->width, shape->height,
++                                                 shape->hotX, shape->hotY, shape->bgra);
++                delete shape;
++                break;
++            }
++            case SDL_CODE_RD_CURSOR_STATE:
++                m_InputHandler->rdSetCursorState((uint32_t)(uintptr_t)event.user.data1,
++                                                 event.user.data2 != nullptr);
++                break;
+             default:
+                 SDL_assert(false);
+             }
+@@ -2328,6 +2427,13 @@ DispatchDeferredCleanup:
+     // Switch back to synchronous logging mode
+     StreamUtils::exitAsyncLoggingMode();
+ 
++    // RD: stop battery reports and close extra monitor streams
++    if (m_RdBatteryTimer != 0) {
++        SDL_RemoveTimer(m_RdBatteryTimer);
++        m_RdBatteryTimer = 0;
++    }
++    RdProfiles::get()->stopSecondaryMonitors();
++
+     // Uncapture the mouse and hide the window immediately,
+     // so we can return to the Qt GUI ASAP.
+     m_InputHandler->setCaptureActive(false);
+diff --git a/app/streaming/session.h b/app/streaming/session.h
+index 77bad0b..84119da 100644
+--- a/app/streaming/session.h
++++ b/app/streaming/session.h
+@@ -223,6 +223,16 @@ private:
+     static
+     void clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right);
+ 
++    // RD extension
++    static
++    void clRdSetCursorShape(uint32_t id, uint16_t width, uint16_t height, uint16_t hotX, uint16_t hotY, const uint8_t* bgra);
++
++    static
++    void clRdSetCursorState(uint32_t id, bool visible);
++
++    static
++    Uint32 rdBatteryTimerCallback(Uint32 interval, void* param);
++
+     static
+     int arInit(int audioConfiguration,
+                const POPUS_MULTISTREAM_CONFIGURATION opusConfig,
+@@ -259,6 +269,7 @@ private:
+     QQuickWindow* m_QtWindow;
+     bool m_UnexpectedTermination;
+     SdlInputHandler* m_InputHandler;
++    SDL_TimerID m_RdBatteryTimer = 0;
+     int m_MouseEmulationRefCount;
+     int m_FlushingWindowEventsRef;
+     QStringList m_LaunchWarnings;
+-- 
+2.55.0.windows.3
+

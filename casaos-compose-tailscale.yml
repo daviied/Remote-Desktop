@@ -1,0 +1,46 @@
+# Tailscale mode (coordinator + power). Paste into CasaOS -> Custom Install -> Import. Edit the values marked EDIT.
+name: rd-coordinator
+services:
+  rd-coordinator:
+    image: ghcr.io/daviied/rd-coordinator:latest
+    container_name: rd-coordinator
+    restart: unless-stopped
+    environment:
+      HEADSCALE_SERVER_URL: https://rd.example.com        # EDIT
+      HEADSCALE_DERP_SERVER_IPV4: 203.0.113.10            # EDIT
+    # 8080 / 8090 are plain HTTP for your nginx only. Never port-forward them on the router.
+    # If nginx runs on this same machine, change them to "127.0.0.1:8080:8080" / "127.0.0.1:8090:8090".
+    ports:
+      - "8080:8080"
+      - "3478:3478/udp"
+    volumes:
+      - /DATA/AppData/rd-coordinator:/var/lib/headscale
+
+  rd-power:
+    image: ghcr.io/daviied/rd-power:latest
+    container_name: rd-power
+    restart: unless-stopped
+    environment:
+      RD_POWER_TOKEN: change-me-to-a-long-random-string   # EDIT
+      HEADSCALE_URL: http://rd-coordinator:8080
+      HEADSCALE_API_KEY: ""                               # EDIT (headscale apikeys create)
+      HOST_NODE: rd-host
+      POWER_BACKEND: homeassistant                        # EDIT: homeassistant | tuya-local | tuya-cloud
+      HA_URL: http://homeassistant.local:8123             # EDIT
+      HA_TOKEN: ""                                        # EDIT
+      HA_ENTITY: switch.pc_outlet                         # EDIT
+      TUYA_DEVICE_ID: ""
+      TUYA_LOCAL_KEY: ""
+      TUYA_IP: ""
+      TUYA_VERSION: "3.3"
+    ports:
+      - "8090:8090"
+    depends_on:
+      - rd-coordinator
+
+x-casaos:
+  architectures: [amd64, arm64]
+  main: rd-coordinator
+  title:
+    en_us: RD Coordinator
+  port_map: "8080"

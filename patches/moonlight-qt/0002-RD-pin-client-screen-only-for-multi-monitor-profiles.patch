@@ -1,0 +1,28 @@
+From 0544f639c53df494efa12a66faba396495768aa7 Mon Sep 17 00:00:00 2001
+From: rd <rd@local>
+Date: Mon, 23 Nov 2026 14:50:55 -0600
+Subject: [PATCH 2/3] RD: pin client screen only for multi-monitor profiles
+
+---
+ app/rd/rdprofiles.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/app/rd/rdprofiles.cpp b/app/rd/rdprofiles.cpp
+index 54cd213..7486e29 100644
+--- a/app/rd/rdprofiles.cpp
++++ b/app/rd/rdprofiles.cpp
+@@ -326,7 +326,10 @@ StreamingPreferences* RdProfiles::prepare(StreamingPreferences* cliPrefs, QObjec
+         // Client-drawn cursor needs absolute (desktop) mouse mode.
+         prefs->absoluteMouseMode = true;
+     }
+-    m_ActiveClientDisplay = mon.contains("clientDisplay") ? mon.value("clientDisplay").toInt() : monitorIndex;
++    // Only pin windows to a client screen for multi-monitor profiles
++    m_ActiveClientDisplay = monitors.size() > 1
++            ? (mon.contains("clientDisplay") ? mon.value("clientDisplay").toInt() : monitorIndex)
++            : -1;
+ 
+     // Network rule caps
+     if (!rule.isEmpty()) {
+-- 
+2.55.0.windows.3
+
