@@ -1,0 +1,7 @@
+.env
+data/
+*.key
+*.sqlite*
+.upstream/
+dist/
+build/

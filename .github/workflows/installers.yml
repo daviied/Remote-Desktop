@@ -1,0 +1,105 @@
+name: Installers
+# Builds RD-Client-Setup.exe, RD-Host-Setup.exe (Windows) and RD-Client.pkg (macOS).
+# Inputs: latest successful CI run on branch "rd" of your forks (forks/setup-forks.ps1):
+#   daviied/moonlight-qt (Build) and daviied/Sunshine (CI).
+# Fork artifacts expire after 90 days: re-run the fork CI if a download fails.
+# Optional secret FORKS_TOKEN (read-only PAT) if the default token cannot read fork artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  OWNER: daviied
+  GH_TOKEN: ${{ secrets.FORKS_TOKEN || github.token }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Build rd-hostd.exe
+        shell: msys2 {0}
+        run: |
+          mkdir -p build
+          g++ -std=c++20 -O2 -municode -static -o build/rd-hostd.exe host/rd-hostd/rd-hostd.cpp -luser32 -lgdi32 -lshell32
+
+      - name: Download RD Moonlight and RD Sunshine
+        shell: pwsh
+        run: |
+          function Get-LatestRun($repo, $wf) {
+            $id = gh run list -R "$env:OWNER/$repo" -b rd -w $wf --status success -L 1 --json databaseId -q '.[0].databaseId'
+            if (-not $id) { throw "No successful $wf run on branch rd in $env:OWNER/$repo. Run forks/setup-forks.ps1 first." }
+            $id
+          }
+          gh run download (Get-LatestRun moonlight-qt build.yml) -R "$env:OWNER/moonlight-qt" -p "Moonlight-Windows-x64-*" -D build/moonlight-dl
+          gh run download (Get-LatestRun Sunshine ci.yml) -R "$env:OWNER/Sunshine" -n build-Windows-AMD64 -D build/sunshine
+          $ml = (Get-ChildItem build/moonlight-dl -Recurse -Filter Moonlight.exe | Select-Object -First 1).DirectoryName
+          $msi = (Get-ChildItem build/sunshine -Recurse -Filter "*installer.msi" | Select-Object -First 1).FullName
+          if (-not $ml -or -not $msi) { throw "Moonlight.exe or Sunshine .msi not found in the fork artifacts" }
+          "MOONLIGHT_DIR=$ml" >> $env:GITHUB_ENV
+          "SUNSHINE_MSI=$msi" >> $env:GITHUB_ENV
+
+      - name: Version
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME.TrimStart("v") } else { "0.0.$env:GITHUB_RUN_NUMBER" }
+          "VERSION=$v" >> $env:GITHUB_ENV
+
+      - name: Build installers
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          Push-Location installers/windows
+          & $iscc "/DAppVersion=$env:VERSION" "/DMoonlightDir=$env:MOONLIGHT_DIR" rd-client.iss
+          if ($LASTEXITCODE) { throw "client installer failed" }
+          & $iscc "/DAppVersion=$env:VERSION" "/DSunshineMsi=$env:SUNSHINE_MSI" "/DHostdExe=$((Resolve-Path ../../build/rd-hostd.exe).Path)" rd-host.iss
+          if ($LASTEXITCODE) { throw "host installer failed" }
+          Pop-Location
+          Copy-Item build/rd-hostd.exe dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RD-Windows-${{ env.VERSION }}
+          path: dist/*
+
+      - name: Attach to release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download RD Moonlight .dmg
+        run: |
+          id=$(gh run list -R "$OWNER/moonlight-qt" -b rd -w build.yml --status success -L 1 --json databaseId -q '.[0].databaseId')
+          [ -n "$id" ] || { echo "No successful build.yml run on branch rd in $OWNER/moonlight-qt"; exit 1; }
+          gh run download "$id" -R "$OWNER/moonlight-qt" -p "Moonlight-macOS-*" -D build/dl
+          dmg=$(find build/dl -name '*.dmg' | head -1)
+          [ -n "$dmg" ] || { echo "No .dmg in the fork artifacts"; exit 1; }
+          echo "DMG=$dmg" >> "$GITHUB_ENV"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="0.0.$GITHUB_RUN_NUMBER"; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - name: Build .pkg
+        run: bash installers/macos/build-pkg.sh "$DMG" "$VERSION" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RD-macOS-${{ env.VERSION }}
+          path: dist/*.pkg
+      - name: Attach to release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.pkg
