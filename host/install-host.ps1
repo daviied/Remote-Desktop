@@ -88,6 +88,8 @@ $hostd = Join-Path $rd "rd-hostd.exe"
 if ($HostdExe) { Copy-Item $HostdExe $hostd -Force }
 else { Invoke-WebRequest "https://github.com/$Repo/releases/latest/download/rd-hostd.exe" -OutFile $hostd }
 & $hostd display list
+$vddCount = 0
+if ((& $hostd display list | Select-Object -First 1) -match "^(\d+) virtual") { $vddCount = [int]$Matches[1] }
 
 $sun    = "C:\Program Files\Sunshine"
 $cfgDir = Join-Path $sun "config"
@@ -109,7 +111,8 @@ min_log_level = warning
 "@
 
 function Get-Ports([int]$base) {
-  @{ tcp = @($base - 5, $base, $base + 1, $base + 21); udp = @($base + 9, $base + 10, $base + 11, $base + 13, $base + 21) }
+  # Parentheses needed: in PowerShell the comma binds before + and -
+  @{ tcp = @(($base - 5), $base, ($base + 1), ($base + 21)); udp = @(($base + 9), ($base + 10), ($base + 11), ($base + 13), ($base + 21)) }
 }
 
 Write-Host "== Sunshine instances (one per virtual display)"
@@ -171,7 +174,7 @@ if (-not (Test-Path $usbip)) {
   if (-not (Test-Path $tokFile)) {
     $bytes = New-Object byte[] 24; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     Set-Content -Encoding ascii $tokFile ([BitConverter]::ToString($bytes) -replace "-", "").ToLower()
-    icacls $tokFile /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
+    icacls $tokFile /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
   }
   # -I: isolated mode (ignores PYTHON* env vars, user site-packages and the script folder for imports)
   $act = New-ScheduledTaskAction -Execute $python -Argument "-I `"$rd\rd-usbhost.py`""
@@ -188,7 +191,7 @@ Write-Host "== Smart-outlet power"
 if ($PowerUrl -and $PowerToken) {
   $pj = Join-Path $rd "power.json"
   @{ url = $PowerUrl; token = $PowerToken } | ConvertTo-Json | Set-Content -Encoding utf8 $pj
-  icacls $pj /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
+  icacls $pj /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
   Copy-Item (Join-Path $PSScriptRoot "power-notify.ps1") $rd -Force
 
   # Event trigger: System log, USER32 event 1074 (shutdown / restart started)
@@ -213,11 +216,13 @@ Start-ScheduledTask -TaskName "RD Host Tray"
 2..3 | ForEach-Object { Start-ScheduledTask -TaskName "RD Sunshine Display $_" }
 
 $tokFile = Join-Path $rd "usb-token.txt"
+$vddLine = if ($vddCount -ge 3) { "Virtual displays: $vddCount found" } else { "WARNING: $vddCount virtual display(s) found. Install Virtual Display Driver with 3 monitors (https://github.com/VirtualDrivers/Virtual-Display-Driver). Until then clients stream the current display at its current resolution." }
 $usbLine = if (Test-Path $tokFile) { "USB token (client installer / usb.json): $((Get-Content $tokFile).Trim())" } else { "USB passthrough: off (install usbip-win2, then run setup again)" }
 $summary = @"
 RD host setup done ($Network mode).
 
 Host address for clients: $hostIp
+$vddLine
 $usbLine
 
 Next steps:

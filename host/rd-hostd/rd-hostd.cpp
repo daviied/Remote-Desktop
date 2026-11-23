@@ -335,6 +335,11 @@ static int cmdDisplay(int argc, wchar_t** argv) {
         int h = envInt(L"SUNSHINE_CLIENT_HEIGHT", argc > 5 ? _wtoi(argv[5]) : 0);
         int f = envInt(L"SUNSHINE_CLIENT_FPS", argc > 6 ? _wtoi(argv[6]) : 0);
         logLine(L"attach %d %dx%d@%d", idx, w, h, f);
+        if (idx < 1 || idx > (int)vts.size()) {
+            // No Virtual Display Driver (or fewer monitors): never block the stream; Sunshine uses its current display.
+            logLine(L"attach %d: virtual display not found (%zu found); streaming the current display. Install VDD.", idx, vts.size());
+            return 0;
+        }
         if (!applyTopology({ idx }, {})) return 1;
         Sleep(300);
         arrange(idx, w, h, f);
@@ -344,6 +349,7 @@ static int cmdDisplay(int argc, wchar_t** argv) {
     if (sub == L"detach") {
         logLine(L"detach %d", idx);
         if (idx <= 1) return 0;  // display 1 always stays on (host needs one display)
+        if (idx > (int)vts.size()) return 0;
         if (!applyTopology({}, { idx })) return 1;
         Sleep(300);
         arrange(0, 0, 0, 0);
@@ -351,6 +357,7 @@ static int cmdDisplay(int argc, wchar_t** argv) {
     }
 
     if (sub == L"init") {
+        if (vts.empty()) { logLine(L"init: no virtual displays (install VDD)"); return 0; }
         std::vector<int> off;
         for (int i = 2; i <= (int)vts.size(); i++) off.push_back(i);
         applyTopology({ 1 }, off);
