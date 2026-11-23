@@ -12,7 +12,16 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 
-function Invoke-Git { git @args; if ($LASTEXITCODE -ne 0) { throw "git $args failed" } }
+# Windows PowerShell 5.1 turns native stderr (git progress text) into errors; judge by exit code only.
+function Invoke-Git {
+  $ErrorActionPreference = "Continue"
+  git @args 2>&1 | ForEach-Object { "$_" } | Write-Host
+  if ($LASTEXITCODE -ne 0) { throw "git $args failed" }
+}
+function Invoke-Gh {
+  $ErrorActionPreference = "Continue"
+  gh @args 2>&1 | ForEach-Object { "$_" }
+}
 
 $repos = @(
   @{ name = "moonlight-common-c"; upstream = "moonlight-stream/moonlight-common-c"; patches = "common-c" },
@@ -28,7 +37,7 @@ $commonSha = $null
 
 foreach ($r in $repos) {
   Write-Host "== $($r.name)"
-  gh repo fork $r.upstream --clone=false --default-branch-only 2>$null | Out-Null  # no-op if it exists
+  Invoke-Gh repo fork $r.upstream --clone=false --default-branch-only | Out-Null  # no-op if it exists
 
   $dir  = Join-Path $Work $r.name
   $base = (Get-Content (Join-Path $root "patches\$($r.patches)\BASE_COMMIT")).Trim()
@@ -59,7 +68,7 @@ foreach ($r in $repos) {
     if ($r.name -eq "moonlight-common-c") { $commonSha = (git rev-parse HEAD).Trim() }
 
     # Forks have Actions off by default
-    gh api -X PUT "repos/$Owner/$($r.name)/actions/permissions" -F enabled=true -f allowed_actions=all | Out-Null
+    Invoke-Gh api -X PUT "repos/$Owner/$($r.name)/actions/permissions" -F enabled=true -f allowed_actions=all | Out-Null
     Invoke-Git push -q -f origin rd
   }
   finally { Pop-Location }
@@ -67,7 +76,7 @@ foreach ($r in $repos) {
 
 # Sunshine CI only runs on master pushes; start it by hand on rd.
 Start-Sleep 5
-gh workflow run ci.yml -R "$Owner/Sunshine" --ref rd
+Invoke-Gh workflow run ci.yml -R "$Owner/Sunshine" --ref rd
 Write-Host ""
 Write-Host "Done. Builds:"
 foreach ($r in $repos | Where-Object name -ne "moonlight-common-c") {
